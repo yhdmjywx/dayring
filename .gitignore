@@ -1,0 +1,16 @@
+/target
+
+# 产品文档只保留在本地
+*.md
+*.mdx
+*.rst
+*.pdf
+*.doc
+*.docx
+*.ppt
+*.pptx
+
+# 开发协作说明需要提交（适用于任意目录）
+!AGENTS.md
+!CLAUDE.md
+!CONTRIBUTING.md
