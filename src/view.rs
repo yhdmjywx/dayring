@@ -235,9 +235,8 @@ pub fn field_rect(layout: &UiLayout, focus: Focus) -> Option<Rect> {
 
 fn paint_header(gfx: &mut Gfx, scene: &Scene<'_>) {
     let (year, month, day) = scene.date;
-    text_left(gfx, "一天的形状", 129.0, 63.0, 26.0, true, TEXT);
-    text_left(gfx, &format_date(year, month, day), 131.0, 98.0, 15.0, false, MUTED);
-    text_right(gfx, "24h · 循环", 846.0, 66.0, 15.0, false, MUTED);
+    text_left(gfx, "dayring", 129.0, 63.0, 26.0, true, TEXT);
+    text_right(gfx, &format_date(year, month, day), 846.0, 66.0, 15.0, false, MUTED);
 }
 
 fn paint_ring(gfx: &mut Gfx, scene: &Scene<'_>) {

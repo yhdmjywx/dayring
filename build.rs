@@ -15,7 +15,7 @@ fn main() {
         &manifest_path,
         r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
-  <assemblyIdentity type="win32" name="Dayring" version="0.1.0.0" />
+  <assemblyIdentity type="win32" name="dayring" version="0.1.0.0" />
   <application xmlns="urn:schemas-microsoft-com:asm.v3">
     <windowsSettings>
       <dpiAware xmlns="http://schemas.microsoft.com/SMI/2005/WindowsSettings">true/pm</dpiAware>
@@ -43,11 +43,11 @@ BEGIN
   BEGIN
     BLOCK "040904b0"
     BEGIN
-      VALUE "FileDescription", "一天的形状"
+      VALUE "FileDescription", "dayring"
       VALUE "FileVersion", "{version}"
       VALUE "InternalName", "dayring"
       VALUE "OriginalFilename", "dayring.exe"
-      VALUE "ProductName", "一天的形状"
+      VALUE "ProductName", "dayring"
       VALUE "ProductVersion", "{version}"
     END
   END

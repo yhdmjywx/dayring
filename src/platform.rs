@@ -22,7 +22,7 @@ pub fn attach_console() {
 
 pub fn error_box(message: &str) {
     let text = HSTRING::from(message);
-    let title = HSTRING::from("一天的形状");
+    let title = HSTRING::from("dayring");
     unsafe {
         let _ = MessageBoxW(None, &text, &title, MB_OK | MB_ICONERROR);
     }

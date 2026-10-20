@@ -262,7 +262,7 @@ unsafe fn run_window(launch: Launch, schedule: Schedule) -> Result<()> {
         let hwnd = CreateWindowExW(
             WINDOW_EX_STYLE::default(),
             class_name,
-            w!("一天的形状"),
+            w!("dayring"),
             WS_OVERLAPPEDWINDOW,
             x,
             y,

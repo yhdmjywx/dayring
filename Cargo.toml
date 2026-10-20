@@ -2,7 +2,7 @@
 name = "dayring"
 version = "0.1.0"
 edition = "2021"
-description = "一天的形状 — 24 小时日程圆环"
+description = "dayring — 24 小时日程圆环"
 license = "Apache-2.0"
 publish = false
 
