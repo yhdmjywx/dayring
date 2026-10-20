@@ -10,6 +10,9 @@
 *.ppt
 *.pptx
 
+# 仓库首页需要展示项目介绍和演示
+!/README.md
+
 # 开发协作说明需要提交（适用于任意目录）
 !AGENTS.md
 !CLAUDE.md
