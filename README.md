@@ -1,12 +1,10 @@
 # Dayring
 
-一天的形状。
-
 Windows 上的日程小工具，把一天画成 24 小时圆环。每件事在一天的哪里、占了多久，都能直接看见。
 
 <p align="center">
   <a href="docs/media/dayring.mp4">
-    <img src="docs/media/demo.gif" width="92%" alt="Dayring 演示：在 24 小时圆环上安排一天">
+    <img src="docs/media/demo.gif" width="65%" alt="Dayring 演示：在 24 小时圆环上安排一天">
   </a>
 </p>
 
