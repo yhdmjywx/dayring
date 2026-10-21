@@ -4,7 +4,7 @@
 use crate::model::{duration, Task, DAY, DAY_F, MIN_DURATION};
 
 pub const DESIGN_W: f32 = 1020.0;
-pub const DESIGN_H: f32 = 1142.0;
+pub const DESIGN_H: f32 = 880.0;
 
 /// Measured from the reference: arc centerline, stroke, and label orbit.
 pub const RING_CENTER: Pt = Pt { x: 495.0, y: 422.0 };

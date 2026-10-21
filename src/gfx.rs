@@ -288,57 +288,6 @@ impl Gfx {
         }
     }
 
-    pub fn path(&self, points: &[(f32, f32)], width: f32, color: Color) {
-        if points.len() < 2 {
-            return;
-        }
-        let Some(surface) = &self.surface else {
-            return;
-        };
-        unsafe { surface.brush.SetColor(&color.d2d()) };
-        let brush = &surface.brush;
-        unsafe {
-            if points.len() == 2 {
-                surface.rt.DrawLine(
-                    Vector2 {
-                        X: points[0].0,
-                        Y: points[0].1,
-                    },
-                    Vector2 {
-                        X: points[1].0,
-                        Y: points[1].1,
-                    },
-                    brush,
-                    width,
-                    &self.round,
-                );
-                return;
-            }
-            let Ok(geo) = self.d2d.CreatePathGeometry() else {
-                return;
-            };
-            let Ok(sink) = geo.Open() else {
-                return;
-            };
-            sink.BeginFigure(
-                Vector2 {
-                    X: points[0].0,
-                    Y: points[0].1,
-                },
-                D2D1_FIGURE_BEGIN_HOLLOW,
-            );
-            for point in &points[1..] {
-                sink.AddLine(Vector2 {
-                    X: point.0,
-                    Y: point.1,
-                });
-            }
-            sink.EndFigure(D2D1_FIGURE_END_OPEN);
-            let _ = sink.Close();
-            surface.rt.DrawGeometry(&geo, brush, width, &self.round);
-        }
-    }
-
     /// Clockwise circular arc. `large` selects the sweep longer than half a turn.
     pub fn arc(
         &self,

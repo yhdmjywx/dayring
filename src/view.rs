@@ -1,4 +1,4 @@
-//! Design-pixel layout and paint. One unit here is one pixel of the 1020×1142 reference.
+//! Design-pixel layout and paint. The ring retains its original reference coordinates.
 
 use crate::geom::{hit_test, point_at, Hit, Pt, DESIGN_H, DESIGN_W, HANDLE_R, RING_CENTER, RING_RADIUS, RING_STROKE};
 use crate::gfx::{Align, Canvas, Color, Gfx};
@@ -33,12 +33,11 @@ pub enum Hot {
     None,
     Ring(Hit),
     Chip(u64),
-    Add,
     Field(Focus),
     Clock(TimeField),
     Color(usize),
-    Next,
     Delete,
+    Undo,
     Hour(i32),
     Minute(i32),
     Popup,
@@ -72,17 +71,24 @@ impl Rect {
 
 pub struct UiLayout {
     pub chips: Vec<(u64, Rect)>,
-    pub add: Rect,
     pub name: Rect,
     pub start: Rect,
     pub end: Rect,
     pub clock_start: Rect,
     pub clock_end: Rect,
-    pub colors: [Rect; 5],
-    pub next: Rect,
-    pub delete: Rect,
+    pub toolbar: Option<ToolbarLayout>,
+    pub undo: Rect,
     pub popup: Option<PopupLayout>,
 }
+
+pub struct ToolbarLayout {
+    pub colors: [Rect; 5],
+    pub delete: Rect,
+    from: Pt,
+    to: Pt,
+}
+
+const TOOL_RADIUS: f32 = 166.0;
 
 pub struct PopupLayout {
     pub panel: Rect,
@@ -103,6 +109,8 @@ pub struct Scene<'a> {
     pub caret_on: bool,
     pub hover: Hot,
     pub popup: Option<TimeField>,
+    pub time_error: Option<TimeField>,
+    pub deleted_name: Option<&'a str>,
 }
 
 pub fn canvas_for(client_w: f32, client_h: f32) -> Canvas {
@@ -122,6 +130,7 @@ pub fn layout(
     schedule: &Schedule,
     popup: Option<(TimeField, Pt)>,
     canvas: Canvas,
+    toolbar_visible: bool,
 ) -> UiLayout {
     let tasks = schedule.tasks_by_start();
     let mut widths = Vec::with_capacity(tasks.len());
@@ -137,29 +146,28 @@ pub fn layout(
         x += width + gap;
     }
 
-    let name = Rect::new(115.0, 986.0, 353.0, 56.0);
-    let start = Rect::new(505.0, 986.0, 166.0, 56.0);
-    let end = Rect::new(708.0, 986.0, 166.0, 56.0);
-    let colors = [173.0, 220.0, 267.0, 314.0, 362.0].map(|cx| {
-        Rect::new(cx - 18.0, 1100.0 - 18.0, 36.0, 36.0)
-    });
-    let delete_w = gfx.measure("删除安排", 15.0, false).max(48.0);
+    let name = Rect::new(RING_CENTER.x - 170.0, 364.0, 340.0, 48.0);
+    let start_w = gfx.measure("00:00", 16.0, false);
+    let gap = gfx.measure("  —  ", 16.0, false);
+    let start = Rect::new(RING_CENTER.x - start_w - gap * 0.5 - 8.0, 414.0, start_w + 16.0, 32.0);
+    let end = Rect::new(RING_CENTER.x + gap * 0.5 - 8.0, 414.0, start_w + 16.0, 32.0);
     UiLayout {
         chips,
-        add: Rect::new(803.0, 886.0, 70.0, 50.0),
         name,
         start,
         end,
-        clock_start: clock_rect(start),
-        clock_end: clock_rect(end),
-        colors,
-        next: Rect::new(494.0 - 20.0, 1104.0 - 20.0, 40.0, 40.0),
-        delete: Rect::new(874.0 - delete_w, 1100.0 - 16.0, delete_w, 32.0),
+        clock_start: Rect::new(start.x - 26.0, 416.0, 24.0, 28.0),
+        clock_end: Rect::new(end.right() + 2.0, 416.0, 24.0, 28.0),
+        toolbar: schedule.selected_task().filter(|_| toolbar_visible).and_then(|task| {
+            let reserved = toolbar_reserves(gfx, task, name, start, end);
+            toolbar_layout(task, &reserved)
+        }),
+        undo: Rect::new(RING_CENTER.x - 190.0, 833.0, 380.0, 34.0),
         popup: popup.map(|(field, anchor)| popup_layout(field, anchor, canvas)),
     }
 }
 
-pub fn hit(layout: &UiLayout, schedule: &Schedule, point: Pt) -> Hot {
+pub fn hit(layout: &UiLayout, schedule: &Schedule, point: Pt, undo_visible: bool) -> Hot {
     if let Some(popup) = &layout.popup {
         for (hour, rect) in popup.hours.iter().enumerate() {
             if rect.contains(point) {
@@ -175,50 +183,59 @@ pub fn hit(layout: &UiLayout, schedule: &Schedule, point: Pt) -> Hot {
             return Hot::Popup;
         }
     }
-    if layout.clock_start.contains(point) {
-        return Hot::Clock(TimeField::Start);
+    if undo_visible && layout.undo.contains(point) {
+        return Hot::Undo;
     }
-    if layout.clock_end.contains(point) {
-        return Hot::Clock(TimeField::End);
-    }
-    if layout.add.contains(point) {
-        return Hot::Add;
-    }
-    if layout.delete.contains(point) {
-        return Hot::Delete;
-    }
-    if layout.next.contains(point) {
-        return Hot::Next;
-    }
-    for (index, rect) in layout.colors.iter().enumerate() {
-        if rect.contains(point) {
-            return Hot::Color(index);
+    if let Some(toolbar) = &layout.toolbar {
+        if toolbar.delete.contains(point) {
+            return Hot::Delete;
+        }
+        for (index, rect) in toolbar.colors.iter().enumerate() {
+            if rect.contains(point) {
+                return Hot::Color(index);
+            }
         }
     }
-    for (id, rect) in &layout.chips {
-        if rect.contains(point) {
-            return Hot::Chip(*id);
+    if schedule.selected_task().is_some() {
+        if layout.clock_start.contains(point) {
+            return Hot::Clock(TimeField::Start);
         }
-    }
-    if layout.name.contains(point) {
-        return Hot::Field(Focus::Name);
-    }
-    if layout.start.contains(point) {
-        return Hot::Field(Focus::Start);
-    }
-    if layout.end.contains(point) {
-        return Hot::Field(Focus::End);
+        if layout.clock_end.contains(point) {
+            return Hot::Clock(TimeField::End);
+        }
+        for (id, rect) in &layout.chips {
+            if rect.contains(point) {
+                return Hot::Chip(*id);
+            }
+        }
+        if layout.name.contains(point) {
+            return Hot::Field(Focus::Name);
+        }
+        if layout.start.contains(point) {
+            return Hot::Field(Focus::Start);
+        }
+        if layout.end.contains(point) {
+            return Hot::Field(Focus::End);
+        }
     }
     Hot::Ring(hit_test(schedule.tasks(), schedule.selected_id(), point))
 }
 
 pub fn paint(gfx: &mut Gfx, scene: &Scene<'_>, layout: &UiLayout) {
     paint_header(gfx, scene);
-    paint_ring(gfx, scene);
+    paint_ring(gfx, scene, layout);
     paint_legend(gfx, scene, layout);
     text_center(gfx, "点击空白圆环添加 · 拖动色段移动 · 拖动白点调整时长", 494.5, 811.0, 14.5, false, MUTED);
-    gfx.line(96.0, 858.0, 894.0, 858.0, 1.0, LINE);
-    paint_editor(gfx, scene, layout);
+    if let Some(toolbar) = &layout.toolbar {
+        paint_toolbar(gfx, scene, toolbar);
+    }
+    if let Some(name) = scene.deleted_name {
+        let rect = layout.undo;
+        gfx.fill(rect.x, rect.y, rect.w, rect.h, 12.0, WHITE);
+        gfx.stroke(rect.x, rect.y, rect.w, rect.h, 12.0, 1.0, LINE);
+        gfx.text(&format!("已删除「{name}」"), rect.x + 12.0, rect.y, rect.w - 82.0, rect.h, 13.0, false, MUTED, Align::Left, true);
+        text_right(gfx, "撤销", rect.right() - 14.0, rect.center().y, 13.0, false, TEXT);
+    }
     if let Some(popup) = &layout.popup {
         paint_popup(gfx, scene, popup);
     }
@@ -239,7 +256,7 @@ fn paint_header(gfx: &mut Gfx, scene: &Scene<'_>) {
     text_right(gfx, &format_date(year, month, day), 846.0, 66.0, 15.0, false, MUTED);
 }
 
-fn paint_ring(gfx: &mut Gfx, scene: &Scene<'_>) {
+fn paint_ring(gfx: &mut Gfx, scene: &Scene<'_>, layout: &UiLayout) {
     for hour in 0..24 {
         let minutes = hour as f32 * 60.0;
         let major = hour % 3 == 0;
@@ -277,7 +294,7 @@ fn paint_ring(gfx: &mut Gfx, scene: &Scene<'_>) {
     let outer = point_at(RING_CENTER, RING_RADIUS + RING_STROKE * 0.52, now);
     gfx.line(inner.x, inner.y, outer.x, outer.y, 2.0, RED);
     gfx.circle(outer.x, outer.y, 4.6, RED);
-    paint_center(gfx, scene);
+    paint_center(gfx, scene, layout);
 }
 
 fn paint_arc(gfx: &mut Gfx, task: &Task, selected: bool) {
@@ -304,26 +321,43 @@ fn paint_arc(gfx: &mut Gfx, task: &Task, selected: bool) {
     );
 }
 
-fn paint_center(gfx: &mut Gfx, scene: &Scene<'_>) {
-    text_center(gfx, "当前选中", RING_CENTER.x, 349.0, 14.0, false, MUTED);
-    let name = scene.schedule.selected_task().map(|task| task.name.as_str()).unwrap_or("");
-    let name = if name.is_empty() {
-        if scene.schedule.selected_task().is_some() {
-            "未命名"
+fn paint_center(gfx: &mut Gfx, scene: &Scene<'_>, layout: &UiLayout) {
+    if scene.schedule.selected_task().is_some() {
+        text_center(gfx, "当前选中", RING_CENTER.x, 349.0, 14.0, false, MUTED);
+        if scene.focus == Focus::Name {
+            paint_inline_field(gfx, layout.name, scene.name_text, scene, Focus::Name);
         } else {
-            "无安排"
+            let name = if scene.name_text.is_empty() { "未命名" } else { scene.name_text };
+            gfx.text(name, layout.name.x, layout.name.y, layout.name.w, layout.name.h, 36.0, true, TEXT, Align::Center, true);
+            paint_field_hint(gfx, layout.name, scene.hover == Hot::Field(Focus::Name));
+        }
+        for (rect, text, focus, field) in [
+            (layout.start, scene.start_text, Focus::Start, TimeField::Start),
+            (layout.end, scene.end_text, Focus::End, TimeField::End),
+        ] {
+            if scene.focus == focus {
+                paint_inline_field(gfx, rect, text, scene, focus);
+            } else {
+                text_center(gfx, text, rect.center().x, rect.center().y, 16.0, false, MUTED);
+                paint_field_hint(gfx, rect, scene.hover == Hot::Field(focus));
+            }
+            let clock = if field == TimeField::Start { layout.clock_start } else { layout.clock_end };
+            if scene.focus == focus || scene.hover == Hot::Field(focus)
+                || scene.hover == Hot::Clock(field) || scene.popup == Some(field) {
+                paint_clock(gfx, clock.center(), 6.5);
+            }
+        }
+        text_center(gfx, "—", RING_CENTER.x, 430.0, 16.0, false, MUTED);
+        if scene.time_error.is_some() {
+            text_center(gfx, "请输入有效时间，如 09:30", RING_CENTER.x, 462.0, 12.0, false, RED);
+        } else {
+            gfx.line(RING_CENTER.x - 16.0, 462.0, RING_CENTER.x + 16.0, 462.0, 1.0, Color::rgb(0xE4E4E4));
         }
     } else {
-        name
-    };
-    gfx.text(name, RING_CENTER.x - 170.0, 388.0 - 24.0, 340.0, 48.0, 36.0, true, TEXT, Align::Center, true);
-    let range = scene
-        .schedule
-        .selected_task()
-        .map(|task| format!("{}  —  {}", fmt_hhmm(task.start_min), fmt_hhmm(task.end_min)))
-        .unwrap_or_else(|| "—".to_string());
-    text_center(gfx, &range, RING_CENTER.x, 430.0, 16.0, false, MUTED);
-    gfx.line(RING_CENTER.x - 16.0, 462.0, RING_CENTER.x + 16.0, 462.0, 1.0, Color::rgb(0xE4E4E4));
+        text_center(gfx, "暂无安排", RING_CENTER.x, 388.0, 28.0, true, TEXT);
+        text_center(gfx, "点击圆环添加安排", RING_CENTER.x, 430.0, 16.0, false, MUTED);
+        gfx.line(RING_CENTER.x - 16.0, 462.0, RING_CENTER.x + 16.0, 462.0, 1.0, Color::rgb(0xE4E4E4));
+    }
     let now = (scene.now_min.rem_euclid(DAY_F)) as i32;
     text_center(gfx, &format!("现在 {}", fmt_hhmm(now)), RING_CENTER.x, 494.0, 15.0, false, MUTED);
 }
@@ -352,74 +386,191 @@ fn paint_legend(gfx: &mut Gfx, scene: &Scene<'_>, layout: &UiLayout) {
     }
 }
 
-fn paint_editor(gfx: &mut Gfx, scene: &Scene<'_>, layout: &UiLayout) {
-    text_left(gfx, "编辑安排", 106.0, 911.0, 20.0, true, TEXT);
-    let add_border = if scene.hover == Hot::Add {
-        Color::rgb(0xCFCFCF)
-    } else {
-        LINE
-    };
-    gfx.fill(layout.add.x, layout.add.y, layout.add.w, layout.add.h, 14.0, WHITE);
-    gfx.stroke(layout.add.x, layout.add.y, layout.add.w, layout.add.h, 14.0, 1.0, add_border);
-    let add_center = layout.add.center();
-    text_center(gfx, "+ 新增", add_center.x, add_center.y, 15.0, false, TEXT);
-
-    text_left(gfx, "任务名称", 107.0, 970.0, 14.0, false, MUTED);
-    text_left(gfx, "开始", 505.0, 970.0, 14.0, false, MUTED);
-    text_left(gfx, "结束", 708.0, 970.0, 14.0, false, MUTED);
-    for rect in [layout.name, layout.start, layout.end] {
-        gfx.fill(rect.x, rect.y, rect.w, rect.h, 14.0, WHITE);
-        gfx.stroke(rect.x, rect.y, rect.w, rect.h, 14.0, 1.0, LINE);
-    }
-    paint_field(gfx, layout.name, scene.name_text, scene, Focus::Name, false);
-    paint_field(gfx, layout.start, scene.start_text, scene, Focus::Start, true);
-    paint_field(gfx, layout.end, scene.end_text, scene, Focus::End, true);
-    paint_clock(gfx, layout.clock_start.center(), 7.2);
-    paint_clock(gfx, layout.clock_end.center(), 7.2);
-
-    text_left(gfx, "颜色", 107.0, 1100.0, 14.5, false, MUTED);
-    let selected_color = scene.schedule.selected_task().map(|task| task.color);
-    for (index, rect) in layout.colors.iter().enumerate() {
-        let center = rect.center();
-        if Some(index) == selected_color {
-            gfx.circle_stroke(center.x, center.y, 18.5, 1.6, Color::rgb(0x1A1A1A));
-        }
-        gfx.circle(center.x, center.y, 14.5, Color::rgb(SWATCH[index]));
-    }
-    let next = layout.next.center();
-    gfx.circle_stroke(next.x, next.y, 20.0, 1.15, LINE);
-    paint_chevron(gfx, next);
-    let delete_color = if scene.hover == Hot::Delete { TEXT } else { MUTED };
-    text_right(gfx, "删除安排", 874.0, 1100.0, 15.0, false, delete_color);
+fn toolbar_reserves(gfx: &mut Gfx, task: &Task, name: Rect, start: Rect, end: Rect) -> [Rect; 5] {
+    let title = if task.name.is_empty() { "未命名" } else { &task.name };
+    let title_w = gfx.measure(title, 36.0, true).min(name.w);
+    let label_w = gfx.measure("当前选中", 14.0, false);
+    let now_w = gfx.measure("现在 00:00", 15.0, false);
+    [
+        Rect::new(RING_CENTER.x - label_w * 0.5 - 6.0, 333.0, label_w + 12.0, 32.0),
+        Rect::new(RING_CENTER.x - title_w * 0.5 - 6.0, name.y - 3.0, title_w + 12.0, name.h + 6.0),
+        // Include the clocks beside the two time fields, which can appear on hover.
+        Rect::new(start.x - 30.0, start.y - 4.0, end.right() - start.x + 60.0, start.h + 8.0),
+        Rect::new(RING_CENTER.x - 20.0, 459.0, 40.0, 6.0),
+        Rect::new(RING_CENTER.x - now_w * 0.5 - 6.0, 477.0, now_w + 12.0, 34.0),
+    ]
 }
 
-fn paint_field(gfx: &mut Gfx, rect: Rect, text: &str, scene: &Scene<'_>, focus: Focus, reserve_clock: bool) {
-    let focused = scene.focus == focus;
-    let reserve = if reserve_clock { 36.0 } else { 12.0 };
-    let inner_w = (rect.w - 16.0 - reserve).max(8.0);
-    let (caret, anchor) = if focused {
-        (scene.caret.min(text.len()), scene.anchor.min(text.len()))
-    } else {
-        (0, 0)
-    };
-    let mut shift = 0.0;
-    if focused {
-        let caret_x = gfx.measure(&text[..caret], 18.0, false);
-        if caret_x > inner_w - 8.0 {
-            shift = caret_x - (inner_w - 8.0);
+const TOOL_FROM: f32 = -66.0;
+const TOOL_TO: f32 = 76.0;
+const TOOL_CLEARANCE: f32 = 22.0; // Enclose the painted arc and full click bounds, plus clearance.
+const ANGLE_EPS: f32 = 0.0001;
+
+fn expanded(rect: Rect, padding: f32) -> Rect {
+    Rect::new(rect.x - padding, rect.y - padding, rect.w + padding * 2.0, rect.h + padding * 2.0)
+}
+
+// Angles where the toolbar centerline crosses a rectangle. These boundaries split
+// the circular orbit into intervals with a constant inside/outside classification.
+fn circle_rect_intervals(rect: Rect) -> Vec<(f32, f32)> {
+    use std::f32::consts::{PI, TAU};
+    let mut cuts = vec![0.0, TAU];
+    for x in [rect.x, rect.right()] {
+        let sin = (x - RING_CENTER.x) / TOOL_RADIUS;
+        if (-1.0..=1.0).contains(&sin) {
+            let angle = sin.asin();
+            cuts.extend([angle.rem_euclid(TAU), (PI - angle).rem_euclid(TAU)]);
         }
     }
-    gfx.clip(rect.x + 8.0, rect.y + 6.0, inner_w + 8.0, rect.h - 12.0);
-    if focused && caret != anchor {
-        let (start, end) = if caret < anchor { (caret, anchor) } else { (anchor, caret) };
-        let x0 = rect.x + 16.0 - shift + gfx.measure(&text[..start], 18.0, false);
-        let x1 = rect.x + 16.0 - shift + gfx.measure(&text[..end], 18.0, false);
-        gfx.fill(x0, rect.y + 16.0, (x1 - x0).max(1.0), rect.h - 32.0, 3.0, Color::rgb(0xE8E8E8));
+    for y in [rect.y, rect.y + rect.h] {
+        let cos = (RING_CENTER.y - y) / TOOL_RADIUS;
+        if (-1.0..=1.0).contains(&cos) {
+            let angle = cos.acos();
+            cuts.extend([angle, (TAU - angle).rem_euclid(TAU)]);
+        }
     }
-    gfx.text(text, rect.x + 16.0 - shift, rect.y, 4_000.0, rect.h, 18.0, false, TEXT, Align::Left, false);
-    if focused && scene.caret_on {
-        let x = rect.x + 16.0 - shift + gfx.measure(&text[..caret], 18.0, false);
-        gfx.line(x, rect.y + 16.0, x, rect.y + rect.h - 16.0, 1.15, TEXT);
+    cuts.sort_by(f32::total_cmp);
+    cuts.dedup_by(|a, b| (*a - *b).abs() < 0.000001);
+    cuts.windows(2).filter_map(|pair| {
+        let point = point_at(RING_CENTER, TOOL_RADIUS, (pair[0] + pair[1]) * 0.5 / TAU * DAY_F);
+        rect.contains(point).then_some((pair[0], pair[1]))
+    }).collect()
+}
+
+// Find the nearest legal anchor on a circle, including intervals that wrap midnight.
+// Expand the obstacles by the entire painted arc, rather than checking only buttons.
+fn toolbar_anchor(preferred: f32, reserved: &[Rect]) -> Option<f32> {
+    use std::f32::consts::TAU;
+    let mut blocked = Vec::<(f32, f32)>::new();
+    for rect in reserved {
+        for (from, to) in circle_rect_intervals(expanded(*rect, TOOL_CLEARANCE)) {
+            let begin = from - TOOL_TO / TOOL_RADIUS - ANGLE_EPS;
+            let finish = to - TOOL_FROM / TOOL_RADIUS + ANGLE_EPS;
+            let span = finish - begin;
+            if span >= TAU { return None; }
+            let begin = begin.rem_euclid(TAU);
+            let finish = begin + span;
+            if finish <= TAU {
+                blocked.push((begin, finish));
+            } else {
+                blocked.extend([(begin, TAU), (0.0, finish - TAU)]);
+            }
+        }
+    }
+    blocked.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let mut merged = Vec::<(f32, f32)>::new();
+    for (from, to) in blocked {
+        if let Some(last) = merged.last_mut().filter(|last| last.1 >= from) {
+            last.1 = last.1.max(to);
+        } else {
+            merged.push((from, to));
+        }
+    }
+    let mut available = Vec::new();
+    let mut cursor = 0.0;
+    for (from, to) in merged {
+        if from > cursor { available.push((cursor, from)); }
+        cursor = to;
+    }
+    if cursor < TAU { available.push((cursor, TAU)); }
+    let preferred = preferred.rem_euclid(TAU);
+    if available.iter().any(|(from, to)| preferred >= *from && preferred <= *to) {
+        return Some(preferred);
+    }
+    let mut best = None;
+    let mut best_distance = f32::INFINITY;
+    for (from, to) in available {
+        for target in [preferred - TAU, preferred, preferred + TAU] {
+            let candidate = target.clamp(from, to);
+            let distance = (candidate - target).abs();
+            if distance < best_distance {
+                best = Some(candidate.rem_euclid(TAU));
+                best_distance = distance;
+            }
+        }
+    }
+    best
+}
+
+fn toolbar_layout(task: &Task, reserved: &[Rect]) -> Option<ToolbarLayout> {
+    use std::f32::consts::TAU;
+    let midpoint = task.start_min as f32 + duration(task.start_min, task.end_min) as f32 * 0.5;
+    // The unequal color/delete spacing has a geometric center five pixels after
+    // the old zero offset. Align the visible arc midpoint with the task midpoint.
+    let preferred = midpoint / DAY_F * TAU - (TOOL_FROM + TOOL_TO) * 0.5 / TOOL_RADIUS;
+    let anchor = toolbar_anchor(preferred, reserved)?;
+    let at = |offset: f32| point_at(RING_CENTER, TOOL_RADIUS, (anchor + offset / TOOL_RADIUS) / TAU * DAY_F);
+    let colors = [-66.0, -41.0, -16.0, 9.0, 34.0].map(|offset| {
+        let point = at(offset);
+        Rect::new(point.x - 11.0, point.y - 11.0, 22.0, 22.0)
+    });
+    let delete = at(TOOL_TO);
+    Some(ToolbarLayout {
+        colors,
+        delete: Rect::new(delete.x - 16.0, delete.y - 12.0, 32.0, 24.0),
+        from: at(TOOL_FROM),
+        to: at(TOOL_TO),
+    })
+}
+
+fn paint_toolbar(gfx: &mut Gfx, scene: &Scene<'_>, toolbar: &ToolbarLayout) {
+    let from = (toolbar.from.x, toolbar.from.y);
+    let to = (toolbar.to.x, toolbar.to.y);
+    gfx.arc(from, to, TOOL_RADIUS, 28.0, LINE, false);
+    gfx.arc(from, to, TOOL_RADIUS, 26.0, WHITE, false);
+    let selected_color = scene.schedule.selected_task().map(|task| task.color);
+    for (index, rect) in toolbar.colors.iter().enumerate() {
+        let center = rect.center();
+        if Some(index) == selected_color || scene.hover == Hot::Color(index) {
+            gfx.circle_stroke(center.x, center.y, 10.0, 1.2, Color::rgb(0x1A1A1A));
+        }
+        gfx.circle(center.x, center.y, 8.0, Color::rgb(SWATCH[index]));
+    }
+    let center = toolbar.delete.center();
+    text_center(gfx, "删除", center.x, center.y, 12.0, false, if scene.hover == Hot::Delete { RED } else { MUTED });
+}
+
+fn paint_field_hint(gfx: &mut Gfx, rect: Rect, hovered: bool) {
+    if hovered {
+        gfx.line(rect.x + 8.0, rect.y + rect.h - 1.0, rect.right() - 8.0, rect.y + rect.h - 1.0, 1.0, LINE);
+    }
+}
+
+pub fn field_style(focus: Focus) -> (f32, bool) {
+    if focus == Focus::Name { (36.0, true) } else { (16.0, false) }
+}
+
+pub fn field_text_x(gfx: &mut Gfx, rect: Rect, focus: Focus, text: &str, caret: usize) -> f32 {
+    let (size, bold) = field_style(focus);
+    let width = gfx.measure(text, size, bold);
+    let available = rect.w - 16.0;
+    if width <= available {
+        return rect.x + (rect.w - width) * 0.5;
+    }
+    let before_caret = gfx.measure(&text[..caret.min(text.len())], size, bold);
+    let shift = (before_caret - available + 8.0).max(0.0).min(width - available);
+    rect.x + 8.0 - shift
+}
+
+fn paint_inline_field(gfx: &mut Gfx, rect: Rect, text: &str, scene: &Scene<'_>, focus: Focus) {
+    let error = matches!((focus, scene.time_error), (Focus::Start, Some(TimeField::Start)) | (Focus::End, Some(TimeField::End)));
+    gfx.fill(rect.x, rect.y, rect.w, rect.h, 7.0, WHITE);
+    gfx.stroke(rect.x, rect.y, rect.w, rect.h, 7.0, 1.0, if error { RED } else { LINE });
+    let (size, bold) = field_style(focus);
+    let caret = scene.caret.min(text.len());
+    let anchor = scene.anchor.min(text.len());
+    let x = field_text_x(gfx, rect, focus, text, caret);
+    gfx.clip(rect.x + 6.0, rect.y + 2.0, rect.w - 12.0, rect.h - 4.0);
+    if caret != anchor {
+        let (start, end) = if caret < anchor { (caret, anchor) } else { (anchor, caret) };
+        let x0 = x + gfx.measure(&text[..start], size, bold);
+        let x1 = x + gfx.measure(&text[..end], size, bold);
+        gfx.fill(x0, rect.y + 5.0, (x1 - x0).max(1.0), rect.h - 10.0, 3.0, Color::rgb(0xE8E8E8));
+    }
+    gfx.text(text, x, rect.y, 4_000.0, rect.h, size, bold, TEXT, Align::Left, false);
+    if scene.caret_on {
+        let caret_x = x + gfx.measure(&text[..caret], size, bold);
+        gfx.line(caret_x, rect.y + 5.0, caret_x, rect.y + rect.h - 5.0, 1.15, TEXT);
     }
     gfx.unclip();
 }
@@ -471,20 +622,6 @@ fn paint_clock(gfx: &mut Gfx, center: Pt, radius: f32) {
     gfx.line(center.x, center.y, center.x + radius * 0.42, center.y + radius * 0.12, width, color);
 }
 
-fn paint_chevron(gfx: &mut Gfx, center: Pt) {
-    let w = 6.5;
-    let h = 3.6;
-    gfx.path(
-        &[
-            (center.x - w, center.y - h * 0.2),
-            (center.x, center.y + h),
-            (center.x + w, center.y - h * 0.2),
-        ],
-        1.5,
-        MUTED,
-    );
-}
-
 fn popup_layout(_field: TimeField, anchor: Pt, canvas: Canvas) -> PopupLayout {
     let visible = visible_design(canvas);
     let mut x = anchor.x - 36.0;
@@ -533,11 +670,6 @@ fn canvas_client_w(canvas: Canvas) -> f32 {
 
 fn canvas_client_h(canvas: Canvas) -> f32 {
     canvas.origin.1 * 2.0 + DESIGN_H * canvas.k
-}
-
-fn clock_rect(field: Rect) -> Rect {
-    let center = Pt::new(field.right() - 22.0, field.center().y);
-    Rect::new(center.x - 14.0, center.y - 14.0, 28.0, 28.0)
 }
 
 fn chip_width(gfx: &mut Gfx, task: &Task) -> f32 {
@@ -598,5 +730,118 @@ mod tests {
         assert!((fitted.origin.1 - (1040.0 - used_h) * 0.5).abs() < 1e-3);
         let back = to_design(fitted, fitted.origin.0, fitted.origin.1);
         assert!(back.x.abs() < 1e-3 && back.y.abs() < 1e-3);
+    }
+
+    fn test_reserves(gfx: &mut Gfx, task: &Task) -> [Rect; 5] {
+        let canvas = canvas_for(DESIGN_W, DESIGN_H);
+        let base = layout(gfx, &Schedule::demo(), None, canvas, false);
+        toolbar_reserves(gfx, task, base.name, base.start, base.end)
+    }
+
+    fn arc_midpoint(toolbar: &ToolbarLayout) -> f32 {
+        crate::geom::minutes_at(RING_CENTER, Pt::new(
+            (toolbar.from.x + toolbar.to.x) * 0.5,
+            (toolbar.from.y + toolbar.to.y) * 0.5,
+        ))
+    }
+
+    fn circular_distance(a: f32, b: f32) -> f32 {
+        let delta = (a - b).rem_euclid(DAY_F);
+        delta.min(DAY_F - delta)
+    }
+
+    #[test]
+    fn reading_toolbar_stays_aligned_instead_of_shifting_towards_midnight() {
+        let mut gfx = Gfx::new().unwrap();
+        let task = Task { id: 2, name: "阅读".into(), start_min: 19 * 60 + 45, end_min: 22 * 60 + 15, color: 3 };
+        let reserved = test_reserves(&mut gfx, &task);
+        let toolbar = toolbar_layout(&task, &reserved).unwrap();
+        assert!(circular_distance(arc_midpoint(&toolbar), 21.0 * 60.0) < 0.01);
+    }
+
+    #[test]
+    fn short_title_toolbar_tracks_task_continuously_through_midnight() {
+        let mut gfx = Gfx::new().unwrap();
+        let mut task = Task { id: 2, name: "阅读".into(), start_min: 0, end_min: 150, color: 3 };
+        let reserved = test_reserves(&mut gfx, &task);
+        let mut previous = None;
+        for start in 0..=DAY {
+            task.start_min = start % DAY;
+            task.end_min = (start + 150) % DAY;
+            let toolbar = toolbar_layout(&task, &reserved).unwrap();
+            let midpoint = arc_midpoint(&toolbar);
+            assert!(circular_distance(midpoint, start as f32 + 75.0) < 0.01);
+            if let Some(last) = previous {
+                assert!((circular_distance(last, midpoint) - 1.0).abs() < 0.01);
+            }
+            previous = Some(midpoint);
+        }
+    }
+
+    #[test]
+    fn inner_toolbar_keeps_entire_background_and_hit_areas_clear() {
+        let mut gfx = Gfx::new().unwrap();
+        for name in ["阅读", "", "这是一段很长很长的任务名称，会显示省略号"] {
+            let mut task = Task { id: 2, name: name.into(), start_min: 0, end_min: 60, color: 0 };
+            let reserved = test_reserves(&mut gfx, &task);
+            for start in (0..DAY).step_by(15) {
+                task.start_min = start;
+                task.end_min = (start + 60) % DAY;
+                let toolbar = toolbar_layout(&task, &reserved).expect("center information leaves a safe inner arc");
+                for rect in toolbar.colors.iter().chain([&toolbar.delete]) {
+                    let center = rect.center();
+                    assert!((center.dist(RING_CENTER) - TOOL_RADIUS).abs() < 0.01);
+                    for region in reserved {
+                        assert!(rect.x >= region.right() || rect.right() <= region.x || rect.y >= region.y + region.h || rect.y + rect.h <= region.y);
+                    }
+                    for corner in [Pt::new(rect.x, rect.y), Pt::new(rect.right(), rect.y), Pt::new(rect.x, rect.y + rect.h), Pt::new(rect.right(), rect.y + rect.h)] {
+                        assert!(corner.dist(RING_CENTER) < RING_RADIUS - RING_STROKE * 0.5 - 3.0);
+                    }
+                }
+                let from = crate::geom::minutes_at(RING_CENTER, toolbar.from);
+                let span = (TOOL_TO - TOOL_FROM) / TOOL_RADIUS / std::f32::consts::TAU * DAY_F;
+                for index in 0..=200 {
+                    let point = point_at(RING_CENTER, TOOL_RADIUS, from + span * index as f32 / 200.0);
+                    assert!(reserved.iter().all(|region| !expanded(*region, 14.0).contains(point)));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn impossible_placement_has_no_arbitrary_midnight_fallback() {
+        let task = Task { id: 2, name: "阅读".into(), start_min: 1185, end_min: 1335, color: 3 };
+        assert!(toolbar_layout(&task, &[Rect::new(0.0, 0.0, DESIGN_W, DESIGN_H)]).is_none());
+    }
+
+    #[test]
+    fn toolbar_controls_hit_their_painted_positions() {
+        let mut gfx = Gfx::new().unwrap();
+        let mut schedule = Schedule::demo();
+        let task = schedule.selected_task_mut().unwrap();
+        task.name = "阅读".into();
+        task.start_min = 19 * 60 + 45;
+        task.end_min = 22 * 60 + 15;
+        let layout = layout(&mut gfx, &schedule, None, canvas_for(760.0, 632.0), true);
+        let toolbar = layout.toolbar.as_ref().unwrap();
+        for (index, rect) in toolbar.colors.iter().enumerate() {
+            assert_eq!(hit(&layout, &schedule, rect.center(), false), Hot::Color(index));
+        }
+        assert_eq!(hit(&layout, &schedule, toolbar.delete.center(), false), Hot::Delete);
+    }
+
+    #[test]
+    fn hidden_controls_and_empty_center_do_not_intercept_ring_creation() {
+        let mut gfx = Gfx::new().unwrap();
+        let canvas = canvas_for(DESIGN_W, DESIGN_H);
+        let mut schedule = Schedule::demo();
+        let layout = layout(&mut gfx, &schedule, None, canvas, false);
+        assert!(layout.toolbar.is_none());
+        let blank = point_at(RING_CENTER, RING_RADIUS, 18.5 * 60.0);
+        assert_eq!(hit(&layout, &schedule, blank, false), Hot::Ring(Hit::Empty));
+        while schedule.delete_selected().is_some() {}
+        assert_eq!(hit(&layout, &schedule, layout.name.center(), false), Hot::Ring(Hit::Miss));
+        assert_eq!(hit(&layout, &schedule, layout.clock_start.center(), false), Hot::Ring(Hit::Miss));
+        assert_eq!(hit(&layout, &schedule, layout.undo.center(), true), Hot::Undo);
     }
 }

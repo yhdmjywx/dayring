@@ -3,6 +3,7 @@
 
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 use windows::{
     Win32::{
         Foundation::*,
@@ -19,7 +20,7 @@ use windows::{
 
 use crate::geom::{minutes_at, Hit, Pt, RING_CENTER};
 use crate::gfx::{Canvas, Gfx};
-use crate::model::{fmt_hhmm, local_now, Schedule, DAY_F};
+use crate::model::{fmt_hhmm, local_now, DeletedTask, Schedule, DAY_F};
 use crate::platform::{self, outer_size};
 use crate::view::{self, canvas_for, field_rect, to_design, Focus, Hot, Scene, TimeField, UiLayout};
 
@@ -28,9 +29,9 @@ const TIMER_CARET: usize = 2;
 const TIMER_SAVE: usize = 3;
 const SAVE_DELAY_MS: u32 = 350;
 const CLIENT_W: f32 = 980.0;
-const CLIENT_H: f32 = 1040.0;
+const CLIENT_H: f32 = 800.0;
 const MIN_CLIENT_W: f32 = 760.0;
-const MIN_CLIENT_H: f32 = 820.0;
+const MIN_CLIENT_H: f32 = 632.0;
 
 thread_local! {
     static APP: RefCell<Option<App>> = RefCell::new(None);
@@ -62,7 +63,7 @@ fn render_screenshot(
     let mut gfx = Gfx::new().map_err(|error| error.to_string())?;
     let canvas = canvas_for(crate::geom::DESIGN_W, crate::geom::DESIGN_H);
     gfx.set_canvas(canvas);
-    let layout = view::layout(&mut gfx, schedule, None, canvas);
+    let layout = view::layout(&mut gfx, schedule, None, canvas, true);
     let now_min = now.unwrap_or_else(|| local_now().3);
     let date = date.unwrap_or_else(|| {
         let (year, month, day, _) = local_now();
@@ -90,6 +91,8 @@ fn render_screenshot(
         caret_on: false,
         hover: Hot::None,
         popup: None,
+        time_error: None,
+        deleted_name: None,
     };
     let width = crate::geom::DESIGN_W as u32;
     let height = crate::geom::DESIGN_H as u32;
@@ -221,6 +224,10 @@ struct App {
     drag: Option<Drag>,
     popup: Option<TimeField>,
     popup_anchor: Pt,
+    toolbar_open: bool,
+    time_error: Option<TimeField>,
+    deleted: Option<DeletedTask>,
+    notice_until: Option<Instant>,
     now_override: Option<f32>,
     date_override: Option<(i32, u32, u32)>,
 }
@@ -294,6 +301,10 @@ unsafe fn run_window(launch: Launch, schedule: Schedule) -> Result<()> {
             drag: None,
             popup: None,
             popup_anchor: Pt::new(0.0, 0.0),
+            toolbar_open: true,
+            time_error: None,
+            deleted: None,
+            notice_until: None,
             now_override: launch.now,
             date_override: launch.date,
         };
@@ -381,8 +392,17 @@ impl App {
                 self.mouse_up(x, y);
                 Some(LRESULT(0))
             }
+            WM_CAPTURECHANGED | WM_CANCELMODE => {
+                self.drag = None;
+                self.press = None;
+                self.invalidate();
+                None
+            }
             WM_TIMER => match wp.0 {
                 TIMER_CLOCK => {
+                    if self.notice_until.is_some_and(|until| Instant::now() >= until) {
+                        self.notice_until = None;
+                    }
                     if self.dirty {
                         self.flush();
                     }
@@ -421,6 +441,9 @@ impl App {
                 None
             }
             WM_CLOSE => {
+                if !self.blur_commit() {
+                    self.cancel_edit();
+                }
                 self.flush();
                 None
             }
@@ -467,7 +490,7 @@ impl App {
         };
         let hwnd = self.hwnd;
         let mut gfx = self.gfx.take().expect("drawing context");
-        let layout = view::layout(&mut gfx, &self.schedule, popup_at, canvas);
+        let layout = view::layout(&mut gfx, &self.schedule, popup_at, canvas, self.tools_visible());
         gfx.set_canvas(canvas);
         if gfx.begin_hwnd(hwnd).unwrap_or(false) {
             let scene = Scene {
@@ -483,6 +506,8 @@ impl App {
                 caret_on,
                 hover,
                 popup,
+                time_error: self.time_error,
+                deleted_name: self.deleted_name(),
             };
             view::paint(&mut gfx, &scene, &layout);
             gfx.end();
@@ -496,37 +521,36 @@ impl App {
     fn mouse_down(&mut self, x: f32, y: f32) {
         let (hot, point, layout, _) = self.hot_at(x, y);
         if self.popup.is_some() && !matches!(hot, Hot::Hour(_) | Hot::Minute(_) | Hot::Popup) {
+            // Closing a picker must not consume a click on the ring or another task.
             self.popup = None;
-            self.press = None;
+        }
+        if !matches!(hot, Hot::Field(_) | Hot::Clock(_) | Hot::Hour(_) | Hot::Minute(_) | Hot::Popup)
+            && !self.blur_commit() {
             self.invalidate();
             return;
         }
-        unsafe {
-            let _ = SetCapture(self.hwnd);
-        }
-        self.press = Some(Press {
-            hot,
-            start: point,
-            moved: false,
-        });
+        unsafe { let _ = SetCapture(self.hwnd); }
+        self.press = Some(Press { hot, start: point, moved: false });
         match hot {
             Hot::Hour(hour) => self.pick_hour(hour),
             Hot::Minute(minute) => self.pick_minute(minute),
             Hot::Popup => {}
             Hot::Clock(field) => {
+                if matches!(self.focus, Focus::Start | Focus::End) {
+                    self.cancel_edit();
+                } else if !self.blur_commit() {
+                    return;
+                }
                 self.popup = Some(field);
                 self.popup_anchor = point;
             }
             Hot::Field(focus) => self.focus_field(focus, point, &layout),
-            Hot::Chip(id) => {
-                self.blur_commit();
-                self.select_task(id, false);
-            }
+            Hot::Chip(id) => self.select_task(id, false),
             Hot::Ring(Hit::HandleStart(id)) => self.begin_drag(id, true, point),
             Hot::Ring(Hit::HandleEnd(id)) => self.begin_drag(id, false, point),
             Hot::Ring(Hit::Body(id)) => self.begin_move(id, point),
-            Hot::Ring(Hit::Miss) | Hot::None => self.blur_commit(),
-            Hot::Ring(Hit::Empty) | Hot::Add | Hot::Delete | Hot::Next | Hot::Color(_) => {}
+            Hot::Ring(Hit::Miss) | Hot::None => self.toolbar_open = false,
+            Hot::Ring(Hit::Empty) | Hot::Delete | Hot::Undo | Hot::Color(_) => {}
         }
         self.hover = hot;
         self.invalidate();
@@ -569,20 +593,21 @@ impl App {
 
     fn activate(&mut self, hot: Hot, point: Pt) {
         match hot {
-            Hot::Add => self.add_from_now(),
             Hot::Delete => self.delete_selected(),
-            Hot::Next => self.select_next(),
+            Hot::Undo => self.undo_delete(),
             Hot::Color(index) => {
-                self.blur_commit();
-                if self.schedule.set_color(index) {
+                if self.blur_commit() && self.schedule.set_color(index) {
                     self.mark();
                 }
             }
             Hot::Ring(Hit::Empty) => {
-                self.blur_commit();
+                if !self.blur_commit() { return; }
                 let start = minutes_at(RING_CENTER, point).round() as i32;
                 self.schedule.add_task(start);
                 self.sync_selection();
+                self.toolbar_open = true;
+                self.begin_edit(Focus::Name);
+                self.name.anchor = 0;
                 self.mark();
             }
             _ => {}
@@ -590,7 +615,7 @@ impl App {
     }
 
     fn begin_move(&mut self, id: u64, point: Pt) {
-        self.blur_commit();
+        if !self.blur_commit() { return; }
         self.select_task(id, false);
         let Some(task) = self.schedule.tasks().iter().find(|task| task.id == id).cloned() else {
             return;
@@ -605,7 +630,7 @@ impl App {
     }
 
     fn begin_drag(&mut self, id: u64, start_handle: bool, _point: Pt) {
-        self.blur_commit();
+        if !self.blur_commit() { return; }
         self.select_task(id, false);
         self.drag = Some(if start_handle {
             Drag::Start { id }
@@ -659,32 +684,39 @@ impl App {
         }
     }
 
+    fn begin_edit(&mut self, focus: Focus) {
+        if self.schedule.selected_task().is_none() { return; }
+        let text = match focus {
+            Focus::Name => self.schedule.selected_task().unwrap().name.clone(),
+            Focus::Start => self.saved_time(TimeField::Start),
+            Focus::End => self.saved_time(TimeField::End),
+            Focus::None => return,
+        };
+        self.focus = focus;
+        self.time_error = None;
+        self.editor_mut().unwrap().set(text);
+        self.caret_on = true;
+        self.arm_caret();
+    }
+
     fn focus_field(&mut self, focus: Focus, point: Pt, layout: &UiLayout) {
         let shift = key_down(VK_SHIFT.0);
         let switching = self.focus != focus;
         if switching {
-            self.commit_time_focus();
-            match focus {
-                Focus::Start => self.start.set(self.saved_time(TimeField::Start)),
-                Focus::End => self.end.set(self.saved_time(TimeField::End)),
-                Focus::Name | Focus::None => {}
-            }
-            self.focus = focus;
-            self.caret_on = true;
-            self.arm_caret();
+            if !self.blur_commit() { return; }
+            self.begin_edit(focus);
         }
         let text = self.focused_text();
-        let Some(rect) = field_rect(layout, focus) else {
-            return;
-        };
+        let Some(rect) = field_rect(layout, focus) else { return; };
+        let caret = self.editor().map(|editor| editor.caret).unwrap_or(0);
         let mut gfx = self.gfx.take().expect("drawing context");
-        let index = gfx.caret_index(&text, 18.0, false, point.x - rect.x - 16.0);
+        let (size, bold) = view::field_style(focus);
+        let origin = view::field_text_x(&mut gfx, rect, focus, &text, caret);
+        let index = gfx.caret_index(&text, size, bold, point.x - origin);
         self.gfx = Some(gfx);
         if let Some(editor) = self.editor_mut() {
             editor.caret = index;
-            if switching || !shift {
-                editor.anchor = index;
-            }
+            if switching || !shift { editor.anchor = index; }
         }
     }
 
@@ -696,13 +728,22 @@ impl App {
                 self.invalidate();
                 return true;
             }
-            self.blur_commit();
+            if self.focus != Focus::None { self.cancel_edit(); }
+            else { self.toolbar_open = false; }
             self.invalidate();
             return true;
         }
-        if vk == VK_DOWN.0 && self.focus == Focus::None && self.popup.is_none() {
-            self.select_next();
-            return true;
+        if self.focus == Focus::None && self.popup.is_none() && self.drag.is_none() {
+            if vk == VK_DELETE.0 {
+                self.delete_selected();
+                self.invalidate();
+                return true;
+            }
+            if ctrl && vk == VK_Z.0 {
+                self.undo_delete();
+                self.invalidate();
+                return true;
+            }
         }
         if vk == VK_TAB.0 && self.schedule.selected_task().is_some() {
             self.cycle_focus(shift);
@@ -773,7 +814,7 @@ impl App {
         };
         if edited {
             self.caret_on = true;
-            self.write_name();
+            self.time_error = None;
             self.invalidate();
         }
         edited || ctrl
@@ -793,7 +834,7 @@ impl App {
             editor.insert(&ch.to_string());
         }
         self.caret_on = true;
-        self.write_name();
+        self.time_error = None;
         self.invalidate();
     }
 
@@ -813,15 +854,7 @@ impl App {
                 Focus::Start => Focus::End,
             }
         };
-        self.commit_time_focus();
-        match next {
-            Focus::Start => self.start.set(self.saved_time(TimeField::Start)),
-            Focus::End => self.end.set(self.saved_time(TimeField::End)),
-            Focus::Name | Focus::None => {}
-        }
-        self.focus = next;
-        self.caret_on = true;
-        self.arm_caret();
+        if self.blur_commit() { self.begin_edit(next); }
     }
 
     fn backspace(&mut self) {
@@ -877,39 +910,44 @@ impl App {
         }
     }
 
-    fn write_name(&mut self) {
-        if self.focus == Focus::Name && self.schedule.set_name(self.name.text.clone()) {
-            self.mark();
+    fn commit_focus(&mut self) -> bool {
+        match self.focus {
+            Focus::Name => {
+                if self.schedule.set_name(self.name.text.clone()) { self.mark(); }
+            }
+            Focus::Start | Focus::End => {
+                let field = if self.focus == Focus::Start { TimeField::Start } else { TimeField::End };
+                let text = self.focused_text();
+                let Some(minutes) = crate::model::parse_hhmm(&text) else {
+                    self.time_error = Some(field);
+                    self.invalidate();
+                    return false;
+                };
+                let changed = match field {
+                    TimeField::Start => self.schedule.set_start(minutes),
+                    TimeField::End => self.schedule.set_end(minutes),
+                };
+                if changed { self.mark(); }
+            }
+            Focus::None => {}
         }
+        self.time_error = None;
+        true
     }
 
-    fn commit_time_focus(&mut self) {
-        if self.focus == Focus::Start {
-            self.commit_time(TimeField::Start, &self.start.text.clone());
-        } else if self.focus == Focus::End {
-            self.commit_time(TimeField::End, &self.end.text.clone());
-        }
-    }
-
-    fn commit_time(&mut self, field: TimeField, text: &str) {
-        let Some(minutes) = crate::model::parse_hhmm(text) else {
-            return;
-        };
-        let changed = match field {
-            TimeField::Start => self.schedule.set_start(minutes),
-            TimeField::End => self.schedule.set_end(minutes),
-        };
-        if changed {
-            self.mark();
-        }
-    }
-
-    fn blur_commit(&mut self) {
-        if self.focus == Focus::None {
-            return;
-        }
-        self.commit_time_focus();
+    fn blur_commit(&mut self) -> bool {
+        if !self.commit_focus() { return false; }
         self.focus = Focus::None;
+        self.kill_caret();
+        true
+    }
+
+    fn cancel_edit(&mut self) {
+        self.focus = Focus::None;
+        self.time_error = None;
+        self.name.set(self.schedule.selected_task().map(|task| task.name.clone()).unwrap_or_default());
+        self.start.set(self.saved_time(TimeField::Start));
+        self.end.set(self.saved_time(TimeField::End));
         self.kill_caret();
     }
 
@@ -938,6 +976,7 @@ impl App {
             TimeField::Start => self.schedule.set_start(minutes),
             TimeField::End => self.schedule.set_end(minutes),
         };
+        self.time_error = None;
         if matches!(self.focus, Focus::Start | Focus::End) {
             self.focus = Focus::None;
             self.kill_caret();
@@ -951,32 +990,46 @@ impl App {
         let changed = self.schedule.selected_id() != Some(id);
         self.schedule.select(id);
         self.sync_selection();
+        self.toolbar_open = true;
         if changed || force_mark {
             self.mark();
         }
     }
 
-    fn select_next(&mut self) {
-        self.blur_commit();
-        self.schedule.select_next();
-        self.sync_selection();
-        self.mark();
-    }
-
-    fn add_from_now(&mut self) {
-        self.blur_commit();
-        let start = self.now_minutes().round() as i32;
-        self.schedule.add_task(start);
-        self.sync_selection();
-        self.mark();
-    }
-
     fn delete_selected(&mut self) {
-        self.blur_commit();
-        if self.schedule.delete_selected() {
+        if !self.blur_commit() { return; }
+        self.popup = None;
+        if let Some(deleted) = self.schedule.delete_selected() {
+            self.deleted = Some(deleted);
+            self.notice_until = Some(Instant::now() + Duration::from_secs(5));
             self.sync_selection();
+            self.toolbar_open = self.schedule.selected_task().is_some();
             self.mark();
         }
+    }
+
+    fn undo_delete(&mut self) {
+        if !self.blur_commit() { return; }
+        self.popup = None;
+        if let Some(deleted) = self.deleted.take() {
+            if self.schedule.restore_deleted(deleted) {
+                self.sync_selection();
+                self.toolbar_open = true;
+                self.mark();
+            }
+        }
+        self.notice_until = None;
+    }
+
+    fn deleted_name(&self) -> Option<&str> {
+        self.notice_until.filter(|until| Instant::now() < *until)?;
+        self.deleted.as_ref().map(|deleted| {
+            if deleted.task.name.is_empty() { "未命名" } else { deleted.task.name.as_str() }
+        })
+    }
+
+    fn tools_visible(&self) -> bool {
+        self.toolbar_open && self.drag.is_none() && self.focus == Focus::None && self.popup.is_none()
     }
 
     fn sync_selection(&mut self) {
@@ -985,6 +1038,10 @@ impl App {
             return;
         }
         self.bound = id;
+        self.focus = Focus::None;
+        self.popup = None;
+        self.time_error = None;
+        self.kill_caret();
         let name = self.schedule.selected_task().map(|task| task.name.clone()).unwrap_or_default();
         self.name.set(name);
         if self.schedule.selected_task().is_none() {
@@ -1037,8 +1094,8 @@ impl App {
         let point = to_design(canvas, x, y);
         let popup = self.popup.map(|field| (field, self.popup_anchor));
         let mut gfx = self.gfx.take().expect("drawing context");
-        let layout = view::layout(&mut gfx, &self.schedule, popup, canvas);
-        let hot = view::hit(&layout, &self.schedule, point);
+        let layout = view::layout(&mut gfx, &self.schedule, popup, canvas, self.tools_visible());
+        let hot = view::hit(&layout, &self.schedule, point, self.deleted_name().is_some());
         self.gfx = Some(gfx);
         (hot, point, layout, canvas)
     }
@@ -1053,15 +1110,17 @@ impl App {
         let canvas = self.canvas();
         let popup = self.popup.map(|field| (field, self.popup_anchor));
         let mut gfx = self.gfx.take().expect("drawing context");
-        let layout = view::layout(&mut gfx, &self.schedule, popup, canvas);
+        let layout = view::layout(&mut gfx, &self.schedule, popup, canvas, self.tools_visible());
         let Some(rect) = field_rect(&layout, focus) else {
             self.gfx = Some(gfx);
             return;
         };
         let caret = caret.min(text.len());
-        let width = gfx.measure(&text[..caret], 18.0, false);
+        let (size, bold) = view::field_style(focus);
+        let origin = view::field_text_x(&mut gfx, rect, focus, &text, caret);
+        let width = gfx.measure(&text[..caret], size, bold);
         self.gfx = Some(gfx);
-        let x = canvas.origin.0 + (rect.x + 16.0 + width) * canvas.k;
+        let x = canvas.origin.0 + (origin + width) * canvas.k;
         let y = canvas.origin.1 + (rect.y + rect.h * 0.75) * canvas.k;
         platform::ime_follow(self.hwnd, x.round() as i32, y.round() as i32);
     }

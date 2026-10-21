@@ -59,6 +59,12 @@ pub fn parse_hhmm(text: &str) -> Option<i32> {
     Some(snap_minutes((hour * 60 + minute) as f32))
 }
 
+#[derive(Clone, Debug)]
+pub struct DeletedTask {
+    pub task: Task,
+    index: usize,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Schedule {
     tasks: Vec<Task>,
@@ -144,26 +150,6 @@ impl Schedule {
         }
     }
 
-    pub fn select_next(&mut self) {
-        if self.tasks.is_empty() {
-            self.selected = None;
-            return;
-        }
-        let mut order: Vec<u64> = self.tasks.iter().map(|task| task.id).collect();
-        order.sort_by_key(|id| {
-            let task = self.tasks.iter().find(|task| task.id == *id).unwrap();
-            (task.start_min, task.id)
-        });
-        let next = match self.selected {
-            Some(current) => {
-                let index = order.iter().position(|id| *id == current).unwrap_or(0);
-                order[(index + 1) % order.len()]
-            }
-            None => order[0],
-        };
-        self.selected = Some(next);
-    }
-
     pub fn add_task(&mut self, start_min: i32) -> u64 {
         let id = self.next_id;
         self.next_id += 1;
@@ -181,19 +167,22 @@ impl Schedule {
         id
     }
 
-    pub fn delete_selected(&mut self) -> bool {
-        let Some(id) = self.selected else {
+    pub fn delete_selected(&mut self) -> Option<DeletedTask> {
+        let id = self.selected?;
+        let index = self.tasks.iter().position(|task| task.id == id)?;
+        let task = self.tasks.remove(index);
+        // Preserve the existing fallback selection; there is no next-task command.
+        self.selected = self.tasks.iter().min_by_key(|task| (task.start_min, task.id)).map(|task| task.id);
+        Some(DeletedTask { task, index })
+    }
+
+    pub fn restore_deleted(&mut self, deleted: DeletedTask) -> bool {
+        if self.tasks.iter().any(|task| task.id == deleted.task.id) {
             return false;
-        };
-        let Some(index) = self.tasks.iter().position(|task| task.id == id) else {
-            return false;
-        };
-        self.tasks.remove(index);
-        self.selected = self
-            .tasks
-            .iter()
-            .min_by_key(|task| (task.start_min, task.id))
-            .map(|task| task.id);
+        }
+        self.next_id = self.next_id.max(deleted.task.id.saturating_add(1));
+        self.selected = Some(deleted.task.id);
+        self.tasks.insert(deleted.index.min(self.tasks.len()), deleted.task);
         true
     }
 
@@ -533,6 +522,43 @@ mod tests {
         assert_eq!(again.tasks().len(), 4);
         assert!(again.tasks().iter().all(|task| task.name != "创作"));
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn undo_delete_restores_order_without_reverting_other_changes() {
+        let mut schedule = Schedule::demo();
+        let before = schedule.tasks().to_vec();
+        let deleted = schedule.delete_selected().unwrap();
+        let new_id = schedule.add_task(23 * 60);
+        schedule.set_name("后来新增的安排".into());
+        assert!(schedule.restore_deleted(deleted));
+        assert_eq!(&schedule.tasks()[..before.len()], before.as_slice());
+        assert_eq!(schedule.selected_id(), Some(2));
+        let added = schedule.tasks().iter().find(|task| task.id == new_id).unwrap();
+        assert_eq!(added.name, "后来新增的安排");
+        assert_eq!(added.duration(), 60);
+    }
+
+    #[test]
+    fn empty_schedule_roundtrip_and_undo_keep_last_task() {
+        let dir = std::env::temp_dir().join(format!("dayring-empty-{}", std::process::id()));
+        let path = dir.join("schedule.json");
+        let mut schedule = Schedule::demo();
+        while schedule.tasks().len() > 1 {
+            schedule.delete_selected();
+        }
+        let deleted = schedule.delete_selected().unwrap();
+        assert!(schedule.selected_task().is_none());
+        schedule.save(&path).unwrap();
+        let mut loaded = Schedule::load_or_demo(&path);
+        assert!(loaded.tasks().is_empty());
+        assert!(loaded.selected_task().is_none());
+        let restored = deleted.task.clone();
+        assert!(loaded.restore_deleted(deleted));
+        assert_eq!(loaded.selected_task(), Some(&restored));
+        let new_id = loaded.add_task(0);
+        assert_ne!(new_id, restored.id);
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]
