@@ -95,3 +95,9 @@ cargo run -- --data D:\notes\today.json
 ```
 
 日程文件无法解析时，会尝试将原文件备份为同目录下的 `.json.bak` 文件，再恢复示例安排。
+
+## 友情赞助
+
+感谢 supporter [Nongfsq](https://github.com/Nongfsq) 对 Dayring 的友情赞助与支持。
+
+也推荐他的 [frun](https://github.com/Nongfsq/frun)：Windows 上的轻量程序启动器。按 `Alt + Space`，输入名称，回车打开应用。
