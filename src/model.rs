@@ -150,6 +150,22 @@ impl Schedule {
         }
     }
 
+    pub fn clear_selection(&mut self) {
+        self.selected = None;
+    }
+
+    /// Read-only time matching in the existing task order.
+    pub fn current_task(&self, now_min: f32) -> Option<&Task> {
+        self.tasks.iter().find(|task| {
+            (now_min - task.start_min as f32).rem_euclid(DAY_F)
+                < duration(task.start_min, task.end_min) as f32
+        })
+    }
+
+    pub fn displayed_task(&self, now_min: f32) -> Option<&Task> {
+        self.selected_task().or_else(|| self.current_task(now_min))
+    }
+
     pub fn add_task(&mut self, start_min: i32) -> u64 {
         let id = self.next_id;
         self.next_id += 1;
@@ -463,6 +479,33 @@ mod tests {
         assert_eq!(parse_hhmm("23:55"), Some(0));
         assert_eq!(parse_hhmm("9：15"), Some(9 * 60 + 15));
         assert_eq!(parse_hhmm("24:00"), None);
+    }
+
+    #[test]
+    fn current_task_is_read_only_and_uses_half_open_intervals() {
+        let schedule = Schedule::demo();
+        let before = schedule.clone();
+        for (now, expected) in [
+            (7.0 * 60.0 - 0.01, None), (7.0 * 60.0, Some(1)),
+            (9.0 * 60.0 - 0.01, Some(1)), (9.0 * 60.0, Some(2)),
+            (11.5 * 60.0, None), (12.0 * 60.0, Some(3)),
+        ] {
+            assert_eq!(schedule.current_task(now).map(|task| task.id), expected);
+        }
+        assert_eq!(schedule, before);
+    }
+
+    #[test]
+    fn current_task_continues_through_midnight_without_selecting() {
+        let mut schedule = Schedule::demo();
+        let id = schedule.add_task(23 * 60);
+        schedule.selected_task_mut().unwrap().end_min = 60;
+        schedule.clear_selection();
+        for time in [23.0 * 60.0, 24.0 * 60.0 - 0.01, 0.0, 60.0 - 0.01] {
+            assert_eq!(schedule.current_task(time).map(|task| task.id), Some(id));
+            assert_eq!(schedule.selected_id(), None);
+        }
+        assert!(schedule.current_task(60.0).is_none());
     }
 
     #[test]

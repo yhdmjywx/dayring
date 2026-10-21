@@ -70,6 +70,7 @@ impl Rect {
 }
 
 pub struct UiLayout {
+    pub center_task: Option<u64>,
     pub chips: Vec<(u64, Rect)>,
     pub name: Rect,
     pub start: Rect,
@@ -131,6 +132,7 @@ pub fn layout(
     popup: Option<(TimeField, Pt)>,
     canvas: Canvas,
     toolbar_visible: bool,
+    now_min: f32,
 ) -> UiLayout {
     let tasks = schedule.tasks_by_start();
     let mut widths = Vec::with_capacity(tasks.len());
@@ -152,6 +154,7 @@ pub fn layout(
     let start = Rect::new(RING_CENTER.x - start_w - gap * 0.5 - 8.0, 414.0, start_w + 16.0, 32.0);
     let end = Rect::new(RING_CENTER.x + gap * 0.5 - 8.0, 414.0, start_w + 16.0, 32.0);
     UiLayout {
+        center_task: schedule.displayed_task(now_min).map(|task| task.id),
         chips,
         name,
         start,
@@ -196,17 +199,17 @@ pub fn hit(layout: &UiLayout, schedule: &Schedule, point: Pt, undo_visible: bool
             }
         }
     }
-    if schedule.selected_task().is_some() {
+    for (id, rect) in &layout.chips {
+        if rect.contains(point) {
+            return Hot::Chip(*id);
+        }
+    }
+    if layout.center_task.is_some() {
         if layout.clock_start.contains(point) {
             return Hot::Clock(TimeField::Start);
         }
         if layout.clock_end.contains(point) {
             return Hot::Clock(TimeField::End);
-        }
-        for (id, rect) in &layout.chips {
-            if rect.contains(point) {
-                return Hot::Chip(*id);
-            }
         }
         if layout.name.contains(point) {
             return Hot::Field(Focus::Name);
@@ -322,8 +325,9 @@ fn paint_arc(gfx: &mut Gfx, task: &Task, selected: bool) {
 }
 
 fn paint_center(gfx: &mut Gfx, scene: &Scene<'_>, layout: &UiLayout) {
-    if scene.schedule.selected_task().is_some() {
-        text_center(gfx, "当前选中", RING_CENTER.x, 349.0, 14.0, false, MUTED);
+    if scene.schedule.displayed_task(scene.now_min).is_some() {
+        let label = if scene.schedule.selected_id().is_some() { "当前选中" } else { "当前进行" };
+        text_center(gfx, label, RING_CENTER.x, 349.0, 14.0, false, MUTED);
         if scene.focus == Focus::Name {
             paint_inline_field(gfx, layout.name, scene.name_text, scene, Focus::Name);
         } else {
@@ -353,10 +357,6 @@ fn paint_center(gfx: &mut Gfx, scene: &Scene<'_>, layout: &UiLayout) {
         } else {
             gfx.line(RING_CENTER.x - 16.0, 462.0, RING_CENTER.x + 16.0, 462.0, 1.0, Color::rgb(0xE4E4E4));
         }
-    } else {
-        text_center(gfx, "暂无安排", RING_CENTER.x, 388.0, 28.0, true, TEXT);
-        text_center(gfx, "点击圆环添加安排", RING_CENTER.x, 430.0, 16.0, false, MUTED);
-        gfx.line(RING_CENTER.x - 16.0, 462.0, RING_CENTER.x + 16.0, 462.0, 1.0, Color::rgb(0xE4E4E4));
     }
     let now = (scene.now_min.rem_euclid(DAY_F)) as i32;
     text_center(gfx, &format!("现在 {}", fmt_hhmm(now)), RING_CENTER.x, 494.0, 15.0, false, MUTED);
@@ -734,7 +734,7 @@ mod tests {
 
     fn test_reserves(gfx: &mut Gfx, task: &Task) -> [Rect; 5] {
         let canvas = canvas_for(DESIGN_W, DESIGN_H);
-        let base = layout(gfx, &Schedule::demo(), None, canvas, false);
+        let base = layout(gfx, &Schedule::demo(), None, canvas, false, 0.0);
         toolbar_reserves(gfx, task, base.name, base.start, base.end)
     }
 
@@ -822,7 +822,7 @@ mod tests {
         task.name = "阅读".into();
         task.start_min = 19 * 60 + 45;
         task.end_min = 22 * 60 + 15;
-        let layout = layout(&mut gfx, &schedule, None, canvas_for(760.0, 632.0), true);
+        let layout = layout(&mut gfx, &schedule, None, canvas_for(760.0, 632.0), true, 0.0);
         let toolbar = layout.toolbar.as_ref().unwrap();
         for (index, rect) in toolbar.colors.iter().enumerate() {
             assert_eq!(hit(&layout, &schedule, rect.center(), false), Hot::Color(index));
@@ -835,13 +835,42 @@ mod tests {
         let mut gfx = Gfx::new().unwrap();
         let canvas = canvas_for(DESIGN_W, DESIGN_H);
         let mut schedule = Schedule::demo();
-        let layout = layout(&mut gfx, &schedule, None, canvas, false);
+        let layout = layout(&mut gfx, &schedule, None, canvas, false, 0.0);
         assert!(layout.toolbar.is_none());
         let blank = point_at(RING_CENTER, RING_RADIUS, 18.5 * 60.0);
         assert_eq!(hit(&layout, &schedule, blank, false), Hot::Ring(Hit::Empty));
         while schedule.delete_selected().is_some() {}
+        let layout = super::layout(&mut gfx, &schedule, None, canvas, false, 0.0);
         assert_eq!(hit(&layout, &schedule, layout.name.center(), false), Hot::Ring(Hit::Miss));
         assert_eq!(hit(&layout, &schedule, layout.clock_start.center(), false), Hot::Ring(Hit::Miss));
         assert_eq!(hit(&layout, &schedule, layout.undo.center(), true), Hot::Undo);
+    }
+
+    #[test]
+    fn task_labels_remain_clickable_when_no_task_matches_the_clock() {
+        let mut gfx = Gfx::new().unwrap();
+        let mut schedule = Schedule::demo();
+        schedule.clear_selection();
+        let layout = layout(&mut gfx, &schedule, None, canvas_for(DESIGN_W, DESIGN_H), true, 0.0);
+        assert!(layout.toolbar.is_none());
+        assert_eq!(hit(&layout, &schedule, layout.name.center(), false), Hot::Ring(Hit::Miss));
+        for (id, rect) in &layout.chips {
+            assert_eq!(hit(&layout, &schedule, rect.center(), false), Hot::Chip(*id));
+        }
+    }
+
+    #[test]
+    fn current_task_center_is_editable_without_selection_controls() {
+        let mut gfx = Gfx::new().unwrap();
+        let mut schedule = Schedule::demo();
+        schedule.clear_selection();
+        let layout = layout(&mut gfx, &schedule, None, canvas_for(DESIGN_W, DESIGN_H), true, 590.0);
+        assert_eq!(layout.center_task, Some(2));
+        assert!(layout.toolbar.is_none());
+        assert_eq!(hit(&layout, &schedule, layout.name.center(), false), Hot::Field(Focus::Name));
+        assert_eq!(hit(&layout, &schedule, layout.clock_start.center(), false), Hot::Clock(TimeField::Start));
+        let end = point_at(RING_CENTER, RING_RADIUS, 690.0);
+        assert_eq!(hit(&layout, &schedule, end, false), Hot::Ring(Hit::Body(2)));
+        assert_eq!(schedule.selected_id(), None);
     }
 }

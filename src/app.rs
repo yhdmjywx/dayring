@@ -45,7 +45,8 @@ pub struct Launch {
 }
 
 pub fn run(launch: Launch) -> std::result::Result<(), String> {
-    let schedule = Schedule::load_or_demo(&launch.data);
+    let mut schedule = Schedule::load_or_demo(&launch.data);
+    schedule.clear_selection();
     if let Some(path) = &launch.screenshot {
         render_screenshot(path, &schedule, launch.now, launch.date)?;
         println!("screenshot {}", path.display());
@@ -63,19 +64,18 @@ fn render_screenshot(
     let mut gfx = Gfx::new().map_err(|error| error.to_string())?;
     let canvas = canvas_for(crate::geom::DESIGN_W, crate::geom::DESIGN_H);
     gfx.set_canvas(canvas);
-    let layout = view::layout(&mut gfx, schedule, None, canvas, true);
     let now_min = now.unwrap_or_else(|| local_now().3);
+    let layout = view::layout(&mut gfx, schedule, None, canvas, true, now_min);
     let date = date.unwrap_or_else(|| {
         let (year, month, day, _) = local_now();
         (year, month, day)
     });
-    let name = schedule.selected_task().map(|task| task.name.clone()).unwrap_or_default();
-    let start = schedule
-        .selected_task()
+    let displayed = schedule.displayed_task(now_min);
+    let name = displayed.map(|task| task.name.clone()).unwrap_or_default();
+    let start = displayed
         .map(|task| fmt_hhmm(task.start_min))
         .unwrap_or_default();
-    let end = schedule
-        .selected_task()
+    let end = displayed
         .map(|task| fmt_hhmm(task.end_min))
         .unwrap_or_default();
     let scene = Scene {
@@ -234,7 +234,7 @@ struct App {
 
 impl Drop for App {
     fn drop(&mut self) {
-        self.flush();
+        if !self.hwnd.is_invalid() { self.flush(); }
     }
 }
 
@@ -393,8 +393,7 @@ impl App {
                 Some(LRESULT(0))
             }
             WM_CAPTURECHANGED | WM_CANCELMODE => {
-                self.drag = None;
-                self.press = None;
+                self.end_pointer_action(None);
                 self.invalidate();
                 None
             }
@@ -457,6 +456,7 @@ impl App {
     }
 
     fn paint(&mut self) {
+        let now_min = self.now_minutes();
         let (width, height) = self.client_size();
         if width == 0 || height == 0 {
             unsafe {
@@ -470,27 +470,27 @@ impl App {
         let (caret, anchor) = self.editor().map(|editor| (editor.caret, editor.anchor)).unwrap_or((0, 0));
         let caret_on = self.caret_on;
         let hover = self.hover;
-        let now_min = self.now_minutes();
         let date = self.today();
         let popup = self.popup;
+        let displayed = self.schedule.displayed_task(now_min);
         let name = if focus == Focus::Name {
             self.name.text.clone()
         } else {
-            self.schedule.selected_task().map(|task| task.name.clone()).unwrap_or_default()
+            displayed.map(|task| task.name.clone()).unwrap_or_default()
         };
         let start = if focus == Focus::Start {
             self.start.text.clone()
         } else {
-            self.schedule.selected_task().map(|task| fmt_hhmm(task.start_min)).unwrap_or_default()
+            displayed.map(|task| fmt_hhmm(task.start_min)).unwrap_or_default()
         };
         let end = if focus == Focus::End {
             self.end.text.clone()
         } else {
-            self.schedule.selected_task().map(|task| fmt_hhmm(task.end_min)).unwrap_or_default()
+            displayed.map(|task| fmt_hhmm(task.end_min)).unwrap_or_default()
         };
         let hwnd = self.hwnd;
         let mut gfx = self.gfx.take().expect("drawing context");
-        let layout = view::layout(&mut gfx, &self.schedule, popup_at, canvas, self.tools_visible());
+        let layout = view::layout(&mut gfx, &self.schedule, popup_at, canvas, self.tools_visible(), now_min);
         gfx.set_canvas(canvas);
         if gfx.begin_hwnd(hwnd).unwrap_or(false) {
             let scene = Scene {
@@ -522,12 +522,15 @@ impl App {
         let (hot, point, layout, _) = self.hot_at(x, y);
         if self.popup.is_some() && !matches!(hot, Hot::Hour(_) | Hot::Minute(_) | Hot::Popup) {
             // Closing a picker must not consume a click on the ring or another task.
-            self.popup = None;
+            self.close_popup();
         }
         if !matches!(hot, Hot::Field(_) | Hot::Clock(_) | Hot::Hour(_) | Hot::Minute(_) | Hot::Popup)
-            && !self.blur_commit() {
-            self.invalidate();
-            return;
+            && self.focus != Focus::None {
+            if !self.blur_commit() {
+                self.invalidate();
+                return;
+            }
+            self.finish_modification();
         }
         unsafe { let _ = SetCapture(self.hwnd); }
         self.press = Some(Press { hot, start: point, moved: false });
@@ -536,6 +539,7 @@ impl App {
             Hot::Minute(minute) => self.pick_minute(minute),
             Hot::Popup => {}
             Hot::Clock(field) => {
+                if !self.ensure_selection(layout.center_task) { return; }
                 if matches!(self.focus, Focus::Start | Focus::End) {
                     self.cancel_edit();
                 } else if !self.blur_commit() {
@@ -550,7 +554,8 @@ impl App {
             Hot::Ring(Hit::HandleEnd(id)) => self.begin_drag(id, false, point),
             Hot::Ring(Hit::Body(id)) => self.begin_move(id, point),
             Hot::Ring(Hit::Miss) | Hot::None => self.toolbar_open = false,
-            Hot::Ring(Hit::Empty) | Hot::Delete | Hot::Undo | Hot::Color(_) => {}
+            Hot::Delete | Hot::Color(_) => {}
+            Hot::Ring(Hit::Empty) | Hot::Undo => {}
         }
         self.hover = hot;
         self.invalidate();
@@ -566,6 +571,9 @@ impl App {
             }
         }
         let dragged = self.update_drag(point);
+        if dragged {
+            if let Some(press) = self.press.as_mut() { press.moved = true; }
+        }
         let hover_changed = hot != self.hover;
         if hover_changed {
             self.hover = hot;
@@ -577,18 +585,24 @@ impl App {
 
     fn mouse_up(&mut self, x: f32, y: f32) {
         let (hot, _, _, _) = self.hot_at(x, y);
-        let press = self.press.take();
-        self.drag = None;
+        self.end_pointer_action(Some(hot));
         unsafe {
             let _ = ReleaseCapture();
         }
-        if let Some(press) = press {
-            if !press.moved && press.hot == hot {
+        self.hover = hot;
+        self.invalidate();
+    }
+
+    fn end_pointer_action(&mut self, hot: Option<Hot>) {
+        let was_dragging = self.drag.take().is_some();
+        if let Some(press) = self.press.take() {
+            if was_dragging && press.moved {
+                self.finish_modification();
+            }
+            if !press.moved && Some(press.hot) == hot {
                 self.activate(press.hot, press.start);
             }
         }
-        self.hover = hot;
-        self.invalidate();
     }
 
     fn activate(&mut self, hot: Hot, point: Pt) {
@@ -596,9 +610,9 @@ impl App {
             Hot::Delete => self.delete_selected(),
             Hot::Undo => self.undo_delete(),
             Hot::Color(index) => {
-                if self.blur_commit() && self.schedule.set_color(index) {
-                    self.mark();
-                }
+                if !self.blur_commit() { return; }
+                if self.schedule.set_color(index) { self.mark(); }
+                self.finish_modification();
             }
             Hot::Ring(Hit::Empty) => {
                 if !self.blur_commit() { return; }
@@ -685,7 +699,9 @@ impl App {
     }
 
     fn begin_edit(&mut self, focus: Focus) {
-        if self.schedule.selected_task().is_none() { return; }
+        if focus == Focus::None { return; }
+        let task_id = self.schedule.displayed_task(self.now_minutes()).map(|task| task.id);
+        if !self.ensure_selection(task_id) { return; }
         let text = match focus {
             Focus::Name => self.schedule.selected_task().unwrap().name.clone(),
             Focus::Start => self.saved_time(TimeField::Start),
@@ -700,6 +716,7 @@ impl App {
     }
 
     fn focus_field(&mut self, focus: Focus, point: Pt, layout: &UiLayout) {
+        if !self.ensure_selection(layout.center_task) { return; }
         let shift = key_down(VK_SHIFT.0);
         let switching = self.focus != focus;
         if switching {
@@ -724,11 +741,15 @@ impl App {
         let ctrl = key_down(VK_CONTROL.0);
         let shift = key_down(VK_SHIFT.0);
         if vk == VK_ESCAPE.0 {
-            if self.popup.take().is_some() {
+            if self.popup.is_some() {
+                self.close_popup();
                 self.invalidate();
                 return true;
             }
-            if self.focus != Focus::None { self.cancel_edit(); }
+            if self.focus != Focus::None {
+                self.cancel_edit();
+                self.finish_modification();
+            }
             else { self.toolbar_open = false; }
             self.invalidate();
             return true;
@@ -745,13 +766,14 @@ impl App {
                 return true;
             }
         }
-        if vk == VK_TAB.0 && self.schedule.selected_task().is_some() {
+        if vk == VK_TAB.0 && self.schedule.displayed_task(self.now_minutes()).is_some() {
+            self.popup = None;
             self.cycle_focus(shift);
             self.invalidate();
             return true;
         }
         if vk == VK_RETURN.0 && matches!(self.focus, Focus::Start | Focus::End | Focus::Name) {
-            self.blur_commit();
+            if self.blur_commit() { self.finish_modification(); }
             self.invalidate();
             return true;
         }
@@ -1002,9 +1024,8 @@ impl App {
         if let Some(deleted) = self.schedule.delete_selected() {
             self.deleted = Some(deleted);
             self.notice_until = Some(Instant::now() + Duration::from_secs(5));
-            self.sync_selection();
-            self.toolbar_open = self.schedule.selected_task().is_some();
             self.mark();
+            self.finish_modification();
         }
     }
 
@@ -1013,9 +1034,8 @@ impl App {
         self.popup = None;
         if let Some(deleted) = self.deleted.take() {
             if self.schedule.restore_deleted(deleted) {
-                self.sync_selection();
-                self.toolbar_open = true;
                 self.mark();
+                self.finish_modification();
             }
         }
         self.notice_until = None;
@@ -1032,6 +1052,26 @@ impl App {
         self.toolbar_open && self.drag.is_none() && self.focus == Focus::None && self.popup.is_none()
     }
 
+    fn ensure_selection(&mut self, task_id: Option<u64>) -> bool {
+        if self.schedule.selected_id().is_none() {
+            let Some(id) = task_id else { return false; };
+            self.select_task(id, false);
+        }
+        self.schedule.selected_task().is_some()
+    }
+
+    fn finish_modification(&mut self) {
+        self.popup = None;
+        self.drag = None;
+        self.toolbar_open = false;
+        self.schedule.clear_selection();
+        self.sync_selection();
+    }
+
+    fn close_popup(&mut self) {
+        if self.popup.take().is_some() { self.finish_modification(); }
+    }
+
     fn sync_selection(&mut self) {
         let id = self.schedule.selected_id();
         if self.bound == id {
@@ -1044,10 +1084,6 @@ impl App {
         self.kill_caret();
         let name = self.schedule.selected_task().map(|task| task.name.clone()).unwrap_or_default();
         self.name.set(name);
-        if self.schedule.selected_task().is_none() {
-            self.focus = Focus::None;
-            self.kill_caret();
-        }
     }
 
     fn saved_time(&self, field: TimeField) -> String {
@@ -1094,7 +1130,7 @@ impl App {
         let point = to_design(canvas, x, y);
         let popup = self.popup.map(|field| (field, self.popup_anchor));
         let mut gfx = self.gfx.take().expect("drawing context");
-        let layout = view::layout(&mut gfx, &self.schedule, popup, canvas, self.tools_visible());
+        let layout = view::layout(&mut gfx, &self.schedule, popup, canvas, self.tools_visible(), self.now_minutes());
         let hot = view::hit(&layout, &self.schedule, point, self.deleted_name().is_some());
         self.gfx = Some(gfx);
         (hot, point, layout, canvas)
@@ -1110,7 +1146,7 @@ impl App {
         let canvas = self.canvas();
         let popup = self.popup.map(|field| (field, self.popup_anchor));
         let mut gfx = self.gfx.take().expect("drawing context");
-        let layout = view::layout(&mut gfx, &self.schedule, popup, canvas, self.tools_visible());
+        let layout = view::layout(&mut gfx, &self.schedule, popup, canvas, self.tools_visible(), self.now_minutes());
         let Some(rect) = field_rect(&layout, focus) else {
             self.gfx = Some(gfx);
             return;
@@ -1160,6 +1196,7 @@ impl App {
 
     fn mark(&mut self) {
         self.dirty = true;
+        if self.hwnd.is_invalid() { return; }
         unsafe {
             let _ = SetTimer(Some(self.hwnd), TIMER_SAVE, SAVE_DELAY_MS, None);
         }
@@ -1177,18 +1214,21 @@ impl App {
     }
 
     fn invalidate(&self) {
+        if self.hwnd.is_invalid() { return; }
         unsafe {
             let _ = InvalidateRect(Some(self.hwnd), None, false);
         }
     }
 
     fn arm_caret(&self) {
+        if self.hwnd.is_invalid() { return; }
         unsafe {
             let _ = SetTimer(Some(self.hwnd), TIMER_CARET, 530, None);
         }
     }
 
     fn kill_caret(&self) {
+        if self.hwnd.is_invalid() { return; }
         unsafe {
             let _ = KillTimer(Some(self.hwnd), TIMER_CARET);
         }
@@ -1259,4 +1299,206 @@ fn next_boundary(text: &str, index: usize) -> usize {
         next += 1;
     }
     next
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::geom::{point_at, RING_RADIUS};
+
+    fn app() -> App {
+        let mut schedule = Schedule::demo();
+        schedule.clear_selection();
+        App {
+            hwnd: HWND::default(), gfx: None, schedule,
+            path: PathBuf::new(), dirty: false, bound: None,
+            name: Editor::new(), start: Editor::new(), end: Editor::new(),
+            focus: Focus::None, caret_on: false, hover: Hot::None,
+            press: None, drag: None, popup: None,
+            popup_anchor: Pt::new(0.0, 0.0), toolbar_open: false,
+            time_error: None, deleted: None, notice_until: None,
+            now_override: Some(590.0), date_override: None,
+        }
+    }
+
+    fn displayed(app: &App) -> Option<u64> {
+        app.schedule.displayed_task(app.now_minutes()).map(|task| task.id)
+    }
+
+    fn assert_following(app: &App, id: Option<u64>) {
+        assert_eq!(app.schedule.selected_id(), None);
+        assert_eq!(app.focus, Focus::None);
+        assert!(app.popup.is_none() && app.drag.is_none());
+        assert!(!app.tools_visible());
+        assert_eq!(displayed(app), id);
+    }
+
+    #[test]
+    fn current_display_changes_without_selecting_or_saving() {
+        let mut app = app();
+        for (time, id) in [(590.0, Some(2)), (700.0, None), (730.0, Some(3))] {
+            app.now_override = Some(time);
+            assert_following(&app, id);
+        }
+        assert!(!app.dirty);
+        app.key_down(VK_DELETE.0);
+        assert_eq!(app.schedule.tasks().len(), 5);
+        assert!(!app.dirty);
+    }
+
+    #[test]
+    fn manual_selection_survives_clock_changes_until_name_is_confirmed() {
+        let mut app = app();
+        app.select_task(5, false);
+        app.now_override = Some(730.0);
+        assert_eq!(displayed(&app), Some(5));
+        app.begin_edit(Focus::Name);
+        app.name.set("新的名称".into());
+        app.key_down(VK_RETURN.0);
+        assert_eq!(app.schedule.tasks()[4].name, "新的名称");
+        assert_following(&app, Some(3));
+    }
+
+    #[test]
+    fn fields_share_one_selection_and_invalid_time_does_not_finish() {
+        let mut app = app();
+        app.select_task(5, false);
+        app.begin_edit(Focus::Name);
+        app.name.set("修改后的阅读".into());
+        app.cycle_focus(false);
+        assert_eq!(app.focus, Focus::Start);
+        assert_eq!(app.schedule.selected_id(), Some(5));
+        assert_eq!(app.schedule.tasks()[4].name, "修改后的阅读");
+        app.start.set("99:99".into());
+        app.key_down(VK_RETURN.0);
+        assert_eq!(app.focus, Focus::Start);
+        assert_eq!(app.time_error, Some(TimeField::Start));
+        assert_eq!(app.schedule.selected_id(), Some(5));
+        app.start.set("20:15".into());
+        app.key_down(VK_RETURN.0);
+        assert_eq!(app.schedule.tasks()[4].start_min, 1215);
+        assert_following(&app, Some(2));
+    }
+
+    #[test]
+    fn escape_discards_the_field_draft_and_returns_to_current() {
+        let mut app = app();
+        app.select_task(5, false);
+        app.begin_edit(Focus::Name);
+        app.name.set("不要保存".into());
+        app.key_down(VK_ESCAPE.0);
+        assert_eq!(app.schedule.tasks()[4].name, "阅读");
+        assert_following(&app, Some(2));
+    }
+
+    #[test]
+    fn editing_current_task_pins_it_even_when_clock_crosses_its_end() {
+        let mut app = app();
+        app.begin_edit(Focus::Name);
+        assert_eq!(app.schedule.selected_id(), Some(2));
+        app.now_override = Some(700.0);
+        assert_eq!(displayed(&app), Some(2));
+        app.key_down(VK_RETURN.0);
+        assert_following(&app, None);
+    }
+
+    #[test]
+    fn unchanged_confirmed_task_can_become_the_current_display() {
+        let mut app = app();
+        app.begin_edit(Focus::Name);
+        app.key_down(VK_RETURN.0);
+        assert_following(&app, Some(2));
+    }
+
+    #[test]
+    fn picker_keeps_target_for_hour_and_minute_then_finishes_on_close() {
+        for escape in [false, true] {
+            let mut app = app();
+            app.select_task(5, false);
+            app.popup = Some(TimeField::Start);
+            app.pick_hour(19);
+            app.pick_minute(45);
+            assert_eq!(app.schedule.selected_id(), Some(5));
+            assert_eq!(app.schedule.tasks()[4].start_min, 1185);
+            assert_eq!(app.popup, Some(TimeField::Start));
+            if escape { app.key_down(VK_ESCAPE.0); }
+            else { app.close_popup(); }
+            assert_following(&app, Some(2));
+        }
+    }
+
+    #[test]
+    fn closing_picker_can_repin_its_displayed_target_for_the_next_field() {
+        let mut app = app();
+        app.select_task(5, false);
+        app.popup = Some(TimeField::Start);
+        let target = displayed(&app);
+        app.close_popup();
+        assert_eq!(displayed(&app), Some(2));
+        assert!(app.ensure_selection(target));
+        app.begin_edit(Focus::End);
+        assert_eq!(app.schedule.selected_id(), Some(5));
+        assert_eq!(app.end.text, "22:00");
+    }
+
+    #[test]
+    fn ring_click_selects_but_completed_move_or_resize_returns_to_current() {
+        for resize in [false, true] {
+            for moved in [false, true] {
+                let mut app = app();
+                let point = point_at(RING_CENTER, RING_RADIUS, 1200.0);
+                let hot = Hot::Ring(Hit::Body(5));
+                if resize { app.begin_drag(5, true, point); }
+                else { app.begin_move(5, point); }
+                app.press = Some(Press { hot, start: point, moved });
+                if moved {
+                    assert!(app.update_drag(point_at(RING_CENTER, RING_RADIUS, 1230.0)));
+                }
+                app.end_pointer_action(Some(hot));
+                if moved { assert_following(&app, Some(2)); }
+                else { assert_eq!(app.schedule.selected_id(), Some(5)); }
+            }
+        }
+    }
+
+    #[test]
+    fn interrupted_drag_finishes_applied_changes() {
+        let mut app = app();
+        let point = point_at(RING_CENTER, RING_RADIUS, 1200.0);
+        app.begin_move(5, point);
+        app.press = Some(Press { hot: Hot::Ring(Hit::Body(5)), start: point, moved: true });
+        app.update_drag(point_at(RING_CENTER, RING_RADIUS, 1230.0));
+        app.end_pointer_action(None);
+        assert_following(&app, Some(2));
+        assert_eq!(app.schedule.tasks()[4].start_min, 1230);
+    }
+
+    #[test]
+    fn color_delete_and_undo_all_finish_without_selecting_a_fallback_task() {
+        let mut app = app();
+        app.select_task(5, false);
+        app.activate(Hot::Color(1), RING_CENTER);
+        assert_eq!(app.schedule.tasks()[4].color, 1);
+        assert_following(&app, Some(2));
+        app.select_task(2, false);
+        let before = app.schedule.tasks().to_vec();
+        app.delete_selected();
+        assert_eq!(app.schedule.tasks().len(), 4);
+        assert_following(&app, None);
+        app.undo_delete();
+        assert_eq!(app.schedule.tasks(), before);
+        assert_following(&app, Some(2));
+    }
+
+    #[test]
+    fn new_task_stays_selected_while_naming_then_returns_to_current() {
+        let mut app = app();
+        app.activate(Hot::Ring(Hit::Empty), point_at(RING_CENTER, RING_RADIUS, 1110.0));
+        assert_eq!(app.focus, Focus::Name);
+        assert_eq!(app.schedule.selected_id(), Some(6));
+        app.name.set("新任务".into());
+        app.key_down(VK_RETURN.0);
+        assert_eq!(app.schedule.tasks()[5].name, "新任务");
+        assert_following(&app, Some(2));
+    }
 }
