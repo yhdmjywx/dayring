@@ -224,7 +224,6 @@ struct App {
     drag: Option<Drag>,
     popup: Option<TimeField>,
     popup_anchor: Pt,
-    toolbar_open: bool,
     time_error: Option<TimeField>,
     deleted: Option<DeletedTask>,
     notice_until: Option<Instant>,
@@ -301,7 +300,6 @@ unsafe fn run_window(launch: Launch, schedule: Schedule) -> Result<()> {
             drag: None,
             popup: None,
             popup_anchor: Pt::new(0.0, 0.0),
-            toolbar_open: true,
             time_error: None,
             deleted: None,
             notice_until: None,
@@ -520,6 +518,10 @@ impl App {
 
     fn mouse_down(&mut self, x: f32, y: f32) {
         let (hot, point, layout, _) = self.hot_at(x, y);
+        self.begin_pointer_action(hot, point, &layout);
+    }
+
+    fn begin_pointer_action(&mut self, hot: Hot, point: Pt, layout: &UiLayout) {
         if self.popup.is_some() && !matches!(hot, Hot::Hour(_) | Hot::Minute(_) | Hot::Popup) {
             // Closing a picker must not consume a click on the ring or another task.
             self.close_popup();
@@ -530,9 +532,8 @@ impl App {
                 self.invalidate();
                 return;
             }
-            self.finish_modification();
         }
-        unsafe { let _ = SetCapture(self.hwnd); }
+        if !self.hwnd.is_invalid() { unsafe { let _ = SetCapture(self.hwnd); } }
         self.press = Some(Press { hot, start: point, moved: false });
         match hot {
             Hot::Hour(hour) => self.pick_hour(hour),
@@ -548,12 +549,12 @@ impl App {
                 self.popup = Some(field);
                 self.popup_anchor = point;
             }
-            Hot::Field(focus) => self.focus_field(focus, point, &layout),
+            Hot::Field(focus) => self.focus_field(focus, point, layout),
             Hot::Chip(id) => self.select_task(id, false),
             Hot::Ring(Hit::HandleStart(id)) => self.begin_drag(id, true, point),
             Hot::Ring(Hit::HandleEnd(id)) => self.begin_drag(id, false, point),
             Hot::Ring(Hit::Body(id)) => self.begin_move(id, point),
-            Hot::Ring(Hit::Miss) | Hot::None => self.toolbar_open = false,
+            Hot::Ring(Hit::Miss) | Hot::None => self.exit_selection(),
             Hot::Delete | Hot::Color(_) => {}
             Hot::Ring(Hit::Empty) | Hot::Undo => {}
         }
@@ -594,11 +595,8 @@ impl App {
     }
 
     fn end_pointer_action(&mut self, hot: Option<Hot>) {
-        let was_dragging = self.drag.take().is_some();
+        self.drag = None;
         if let Some(press) = self.press.take() {
-            if was_dragging && press.moved {
-                self.finish_modification();
-            }
             if !press.moved && Some(press.hot) == hot {
                 self.activate(press.hot, press.start);
             }
@@ -612,14 +610,12 @@ impl App {
             Hot::Color(index) => {
                 if !self.blur_commit() { return; }
                 if self.schedule.set_color(index) { self.mark(); }
-                self.finish_modification();
             }
             Hot::Ring(Hit::Empty) => {
                 if !self.blur_commit() { return; }
                 let start = minutes_at(RING_CENTER, point).round() as i32;
                 self.schedule.add_task(start);
                 self.sync_selection();
-                self.toolbar_open = true;
                 self.begin_edit(Focus::Name);
                 self.name.anchor = 0;
                 self.mark();
@@ -741,16 +737,16 @@ impl App {
         let ctrl = key_down(VK_CONTROL.0);
         let shift = key_down(VK_SHIFT.0);
         if vk == VK_ESCAPE.0 {
-            if self.popup.is_some() {
+            if self.drag.is_some() {
+                self.end_pointer_action(None);
+                if !self.hwnd.is_invalid() { unsafe { let _ = ReleaseCapture(); } }
+            } else if self.popup.is_some() {
                 self.close_popup();
-                self.invalidate();
-                return true;
-            }
-            if self.focus != Focus::None {
+            } else if self.focus != Focus::None {
                 self.cancel_edit();
-                self.finish_modification();
+            } else {
+                self.exit_selection();
             }
-            else { self.toolbar_open = false; }
             self.invalidate();
             return true;
         }
@@ -773,7 +769,7 @@ impl App {
             return true;
         }
         if vk == VK_RETURN.0 && matches!(self.focus, Focus::Start | Focus::End | Focus::Name) {
-            if self.blur_commit() { self.finish_modification(); }
+            self.blur_commit();
             self.invalidate();
             return true;
         }
@@ -1012,7 +1008,6 @@ impl App {
         let changed = self.schedule.selected_id() != Some(id);
         self.schedule.select(id);
         self.sync_selection();
-        self.toolbar_open = true;
         if changed || force_mark {
             self.mark();
         }
@@ -1025,7 +1020,7 @@ impl App {
             self.deleted = Some(deleted);
             self.notice_until = Some(Instant::now() + Duration::from_secs(5));
             self.mark();
-            self.finish_modification();
+            self.exit_selection();
         }
     }
 
@@ -1035,7 +1030,7 @@ impl App {
         if let Some(deleted) = self.deleted.take() {
             if self.schedule.restore_deleted(deleted) {
                 self.mark();
-                self.finish_modification();
+                self.sync_selection();
             }
         }
         self.notice_until = None;
@@ -1049,7 +1044,8 @@ impl App {
     }
 
     fn tools_visible(&self) -> bool {
-        self.toolbar_open && self.drag.is_none() && self.focus == Focus::None && self.popup.is_none()
+        self.schedule.selected_task().is_some()
+            && self.drag.is_none() && self.focus == Focus::None && self.popup.is_none()
     }
 
     fn ensure_selection(&mut self, task_id: Option<u64>) -> bool {
@@ -1060,16 +1056,17 @@ impl App {
         self.schedule.selected_task().is_some()
     }
 
-    fn finish_modification(&mut self) {
+    /// End the whole selection session, rather than an individual edit.
+    /// Callers must commit or cancel any active field first.
+    fn exit_selection(&mut self) {
         self.popup = None;
-        self.drag = None;
-        self.toolbar_open = false;
+        self.end_pointer_action(None);
         self.schedule.clear_selection();
         self.sync_selection();
     }
 
     fn close_popup(&mut self) {
-        if self.popup.take().is_some() { self.finish_modification(); }
+        self.popup = None;
     }
 
     fn sync_selection(&mut self) {
@@ -1315,7 +1312,7 @@ mod tests {
             name: Editor::new(), start: Editor::new(), end: Editor::new(),
             focus: Focus::None, caret_on: false, hover: Hot::None,
             press: None, drag: None, popup: None,
-            popup_anchor: Pt::new(0.0, 0.0), toolbar_open: false,
+            popup_anchor: Pt::new(0.0, 0.0),
             time_error: None, deleted: None, notice_until: None,
             now_override: Some(590.0), date_override: None,
         }
@@ -1333,6 +1330,26 @@ mod tests {
         assert_eq!(displayed(app), id);
     }
 
+    fn assert_selected(app: &App, id: u64) {
+        assert_eq!(app.schedule.selected_id(), Some(id));
+        assert_eq!(displayed(app), Some(id));
+        assert_eq!(app.focus, Focus::None);
+        assert!(app.popup.is_none() && app.drag.is_none());
+        assert!(app.tools_visible());
+    }
+
+    fn click_at(app: &mut App, point: Pt) {
+        let mut gfx = Gfx::new().unwrap();
+        let layout = view::layout(&mut gfx, &app.schedule,
+            app.popup.map(|field| (field, app.popup_anchor)),
+            canvas_for(crate::geom::DESIGN_W, crate::geom::DESIGN_H),
+            app.tools_visible(), app.now_minutes());
+        let hot = view::hit(&layout, &app.schedule, point, app.deleted_name().is_some());
+        app.gfx = Some(gfx);
+        app.begin_pointer_action(hot, point, &layout);
+        app.end_pointer_action(Some(hot));
+    }
+
     #[test]
     fn current_display_changes_without_selecting_or_saving() {
         let mut app = app();
@@ -1347,7 +1364,7 @@ mod tests {
     }
 
     #[test]
-    fn manual_selection_survives_clock_changes_until_name_is_confirmed() {
+    fn manual_selection_survives_clock_changes_and_confirmed_edits_until_exit() {
         let mut app = app();
         app.select_task(5, false);
         app.now_override = Some(730.0);
@@ -1356,6 +1373,8 @@ mod tests {
         app.name.set("新的名称".into());
         app.key_down(VK_RETURN.0);
         assert_eq!(app.schedule.tasks()[4].name, "新的名称");
+        assert_selected(&app, 5);
+        app.key_down(VK_ESCAPE.0);
         assert_following(&app, Some(3));
     }
 
@@ -1377,17 +1396,19 @@ mod tests {
         app.start.set("20:15".into());
         app.key_down(VK_RETURN.0);
         assert_eq!(app.schedule.tasks()[4].start_min, 1215);
-        assert_following(&app, Some(2));
+        assert_selected(&app, 5);
     }
 
     #[test]
-    fn escape_discards_the_field_draft_and_returns_to_current() {
+    fn escape_cancels_only_the_field_then_second_escape_exits_selection() {
         let mut app = app();
         app.select_task(5, false);
         app.begin_edit(Focus::Name);
         app.name.set("不要保存".into());
         app.key_down(VK_ESCAPE.0);
         assert_eq!(app.schedule.tasks()[4].name, "阅读");
+        assert_selected(&app, 5);
+        app.key_down(VK_ESCAPE.0);
         assert_following(&app, Some(2));
     }
 
@@ -1399,19 +1420,21 @@ mod tests {
         app.now_override = Some(700.0);
         assert_eq!(displayed(&app), Some(2));
         app.key_down(VK_RETURN.0);
+        assert_selected(&app, 2);
+        app.key_down(VK_ESCAPE.0);
         assert_following(&app, None);
     }
 
     #[test]
-    fn unchanged_confirmed_task_can_become_the_current_display() {
+    fn unchanged_confirmed_task_stays_selected() {
         let mut app = app();
         app.begin_edit(Focus::Name);
         app.key_down(VK_RETURN.0);
-        assert_following(&app, Some(2));
+        assert_selected(&app, 2);
     }
 
     #[test]
-    fn picker_keeps_target_for_hour_and_minute_then_finishes_on_close() {
+    fn closing_picker_keeps_selection_and_restores_tools() {
         for escape in [false, true] {
             let mut app = app();
             app.select_task(5, false);
@@ -1423,26 +1446,26 @@ mod tests {
             assert_eq!(app.popup, Some(TimeField::Start));
             if escape { app.key_down(VK_ESCAPE.0); }
             else { app.close_popup(); }
+            assert_selected(&app, 5);
+            app.key_down(VK_ESCAPE.0);
             assert_following(&app, Some(2));
         }
     }
 
     #[test]
-    fn closing_picker_can_repin_its_displayed_target_for_the_next_field() {
+    fn closing_picker_keeps_target_for_the_next_field() {
         let mut app = app();
         app.select_task(5, false);
         app.popup = Some(TimeField::Start);
-        let target = displayed(&app);
         app.close_popup();
-        assert_eq!(displayed(&app), Some(2));
-        assert!(app.ensure_selection(target));
+        assert_selected(&app, 5);
         app.begin_edit(Focus::End);
         assert_eq!(app.schedule.selected_id(), Some(5));
         assert_eq!(app.end.text, "22:00");
     }
 
     #[test]
-    fn ring_click_selects_but_completed_move_or_resize_returns_to_current() {
+    fn ring_click_and_completed_move_or_resize_keep_selection() {
         for resize in [false, true] {
             for moved in [false, true] {
                 let mut app = app();
@@ -1455,31 +1478,30 @@ mod tests {
                     assert!(app.update_drag(point_at(RING_CENTER, RING_RADIUS, 1230.0)));
                 }
                 app.end_pointer_action(Some(hot));
-                if moved { assert_following(&app, Some(2)); }
-                else { assert_eq!(app.schedule.selected_id(), Some(5)); }
+                assert_selected(&app, 5);
             }
         }
     }
 
     #[test]
-    fn interrupted_drag_finishes_applied_changes() {
+    fn interrupted_drag_keeps_applied_changes_and_selection() {
         let mut app = app();
         let point = point_at(RING_CENTER, RING_RADIUS, 1200.0);
         app.begin_move(5, point);
         app.press = Some(Press { hot: Hot::Ring(Hit::Body(5)), start: point, moved: true });
         app.update_drag(point_at(RING_CENTER, RING_RADIUS, 1230.0));
         app.end_pointer_action(None);
-        assert_following(&app, Some(2));
+        assert_selected(&app, 5);
         assert_eq!(app.schedule.tasks()[4].start_min, 1230);
     }
 
     #[test]
-    fn color_delete_and_undo_all_finish_without_selecting_a_fallback_task() {
+    fn color_delete_and_undo_selection_lifecycle() {
         let mut app = app();
         app.select_task(5, false);
         app.activate(Hot::Color(1), RING_CENTER);
         assert_eq!(app.schedule.tasks()[4].color, 1);
-        assert_following(&app, Some(2));
+        assert_selected(&app, 5);
         app.select_task(2, false);
         let before = app.schedule.tasks().to_vec();
         app.delete_selected();
@@ -1487,11 +1509,11 @@ mod tests {
         assert_following(&app, None);
         app.undo_delete();
         assert_eq!(app.schedule.tasks(), before);
-        assert_following(&app, Some(2));
+        assert_selected(&app, 2);
     }
 
     #[test]
-    fn new_task_stays_selected_while_naming_then_returns_to_current() {
+    fn new_task_stays_selected_after_naming_for_further_configuration() {
         let mut app = app();
         app.activate(Hot::Ring(Hit::Empty), point_at(RING_CENTER, RING_RADIUS, 1110.0));
         assert_eq!(app.focus, Focus::Name);
@@ -1499,6 +1521,92 @@ mod tests {
         app.name.set("新任务".into());
         app.key_down(VK_RETURN.0);
         assert_eq!(app.schedule.tasks()[5].name, "新任务");
+        assert_selected(&app, 6);
+    }
+
+    #[test]
+    fn task_can_be_renamed_recolored_retimed_and_moved_in_one_selection() {
+        let mut app = app();
+        app.select_task(5, false);
+        app.begin_edit(Focus::Name);
+        app.name.set("连续编辑".into());
+        app.key_down(VK_RETURN.0);
+        assert_selected(&app, 5);
+        app.activate(Hot::Color(1), RING_CENTER);
+        assert_selected(&app, 5);
+        app.begin_edit(Focus::Start);
+        app.start.set("19:45".into());
+        app.key_down(VK_RETURN.0);
+        assert_selected(&app, 5);
+        app.begin_edit(Focus::End);
+        app.end.set("22:15".into());
+        app.key_down(VK_RETURN.0);
+        let point = point_at(RING_CENTER, RING_RADIUS, 1260.0);
+        app.begin_move(5, point);
+        app.press = Some(Press { hot: Hot::Ring(Hit::Body(5)), start: point, moved: true });
+        app.update_drag(point_at(RING_CENTER, RING_RADIUS, 1275.0));
+        app.end_pointer_action(Some(Hot::Ring(Hit::Body(5))));
+        assert_selected(&app, 5);
+        let task = &app.schedule.tasks()[4];
+        assert_eq!((&*task.name, task.color, task.start_min, task.end_min), ("连续编辑", 1, 1200, 1350));
+        click_at(&mut app, Pt::new(900.0, 300.0));
+        assert_following(&app, Some(2));
+    }
+
+    #[test]
+    fn background_commits_then_exits_but_invalid_time_blocks_exit() {
+        let mut app = app();
+        app.select_task(5, false);
+        app.begin_edit(Focus::Start);
+        app.start.set("99:99".into());
+        click_at(&mut app, Pt::new(900.0, 300.0));
+        assert_eq!(app.schedule.selected_id(), Some(5));
+        assert_eq!(app.focus, Focus::Start);
+        assert_eq!(app.time_error, Some(TimeField::Start));
+        app.start.set("19:30".into());
+        click_at(&mut app, Pt::new(900.0, 300.0));
+        assert_eq!(app.schedule.tasks()[4].start_min, 1170);
+        assert_following(&app, Some(2));
+    }
+
+    #[test]
+    fn popup_can_close_into_another_field_or_background_without_losing_click() {
+        let mut app = app();
+        app.select_task(5, false);
+        app.popup = Some(TimeField::Start);
+        app.popup_anchor = Pt::new(380.0, 435.0);
+        app.pick_hour(19);
+        click_at(&mut app, Pt::new(RING_CENTER.x, 380.0));
+        assert_eq!(app.focus, Focus::Name);
+        assert_eq!(app.schedule.selected_id(), Some(5));
+        app.key_down(VK_RETURN.0);
+        app.popup = Some(TimeField::Start);
+        click_at(&mut app, Pt::new(900.0, 300.0));
+        assert_following(&app, Some(2));
+    }
+
+    #[test]
+    fn selecting_another_task_commits_draft_and_switches_directly() {
+        let mut app = app();
+        app.select_task(5, false);
+        app.begin_edit(Focus::Name);
+        app.name.set("保留修改".into());
+        click_at(&mut app, point_at(RING_CENTER, RING_RADIUS, 930.0));
+        assert_eq!(app.schedule.tasks()[4].name, "保留修改");
+        assert_selected(&app, 4);
+    }
+
+    #[test]
+    fn escape_ends_drag_before_it_can_exit_selection() {
+        let mut app = app();
+        let point = point_at(RING_CENTER, RING_RADIUS, 1260.0);
+        app.begin_move(5, point);
+        app.press = Some(Press { hot: Hot::Ring(Hit::Body(5)), start: point, moved: true });
+        app.update_drag(point_at(RING_CENTER, RING_RADIUS, 1275.0));
+        app.key_down(VK_ESCAPE.0);
+        assert_selected(&app, 5);
+        assert!(app.press.is_none());
+        app.key_down(VK_ESCAPE.0);
         assert_following(&app, Some(2));
     }
 }
